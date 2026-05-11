@@ -36,6 +36,7 @@ int main(int argc, char* argv[]) {
     bool reconnect_needed = true;
     while (reconnect_needed && !finish) {
 
+    // TODO: Naley zmiień hard codowanie AF_INET
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd < 0) {
         throw std::runtime_error("Błąd podczas tworzenia gniazda: " + std::string(strerror(errno)));
@@ -46,7 +47,11 @@ int main(int argc, char* argv[]) {
         throw std::runtime_error("Błąd podczas łączenia się z serwerem: " + std::string(strerror(errno)));
     }
 
-    std::cerr<< "Połączono z serwerem " << host << " na porcie " << port << std::endl;
+    std::cerr<<config::display_diagnostic_message(
+        "Połączono z serwerem " + std::string(host) + " na porcie " + std::to_string(port), 
+        1, 
+        config.verbosity
+    );
 
 
     //NOw we have to send a GET request to the server, but first we have to prepare the request string
@@ -76,13 +81,13 @@ int main(int argc, char* argv[]) {
         // After Ctrl-C the to-server socket is closed.
         if (finish && poll_descriptors[CLIENT_SOCKET_IDX].fd >= 0) {
             close(poll_descriptors[CLIENT_SOCKET_IDX].fd);
-            poll_descriptors[CLIENT_STDIN_IDX].fd = -1;
+            poll_descriptors[CLIENT_SOCKET_IDX].fd = -1;
         }
 
         int poll_status = poll(poll_descriptors, CONNECTIONS, config.client_timeout_ms);
         if (poll_status == -1 ) {
             if (errno == EINTR) {
-                printf("interrupted system call\n");
+                std::cerr << "interrupted system call\n";
             }
             else {
                 throw std::runtime_error("Błąd podczas oczekiwania na dane: " + std::string(strerror(errno)));
@@ -97,10 +102,10 @@ int main(int argc, char* argv[]) {
                 {
                     buffer[received_bytes] = '\0';
 
-                    if (strncmp(buffer, quit_string, 5) == 0)
+                    if (strncmp(buffer, quit_string, 4) == 0)
                     {
                         finish = 1;
-                        std::cerr << "Zakończenie klienta...\n";
+                        std::cerr<<config::display_diagnostic_message("Otrzymano polecenie zakończenia programu. Kończę...", 1, config.verbosity);
                     }
                 }
             }
@@ -111,20 +116,20 @@ int main(int argc, char* argv[]) {
                 if (received_bytes > 0) {
                     write(STDOUT_FILENO, buffer, received_bytes);
                 } else if (received_bytes == 0) {
-                    std::cerr << "Serwer zamknął połączenie.\n";
+                    std::cerr << config::display_diagnostic_message("Serwer zamknął połączenie.", 1, config.verbosity);
                     finish = 1;
                     reconnect_needed = false;
                 } else {
-                    std::cerr << "Błąd odczytu z socketu.\n";
+                    std::cerr << config::display_diagnostic_message("Błąd odczytu z socketu.", 1, config.verbosity);
                     finish = 1;
                     reconnect_needed = false;
                 }
             }
         }else{
             // poll_status == 0 - timeout
-            std::cerr << "Brak danych do odczytu po upływie timeoutu (" << config.client_timeout_ms << " ms). Ponawiam połączenie...\n";
+            std::cerr << config::display_diagnostic_message("Brak danych do odczytu po upływie timeoutu.", 1, config.verbosity);
             reconnect_needed = true; 
-            
+
             // Wychodzimy z pętli, żeby zamknąć stare gniazdo i otworzyć nowe.
             break;
         }
