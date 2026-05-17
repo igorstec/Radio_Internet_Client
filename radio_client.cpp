@@ -36,16 +36,17 @@ int main(int argc, char* argv[]) {
     bool reconnect_needed = true;
     while (reconnect_needed && !finish) {
 
-    int socket_fd = socket(endpoint.family, SOCK_STREAM, 0);
+    int socket_fd = socket(endpoint.family, endpoint.socktype, endpoint.protocol);
     if (socket_fd < 0) {
         throw std::runtime_error("Błąd podczas tworzenia gniazda: " + std::string(strerror(errno)));
     }
 
-    if (connect(socket_fd,
-            reinterpret_cast<sockaddr*>(&endpoint.addr),
+   if (connect(socket_fd,
+            reinterpret_cast<const sockaddr*>(&endpoint.addr),
             endpoint.addr_len) < 0) {
-    throw std::runtime_error("Błąd podczas łączenia się z serwerem: " + std::string(strerror(errno)));
-    }
+        throw std::runtime_error(
+        "Błąd podczas łączenia się z serwerem: " + std::string(strerror(errno)));
+}
 
     std::cerr<<config::display_diagnostic_message(
         "Połączono z serwerem " + std::string(host) + " na porcie " + std::string(port), 
