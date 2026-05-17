@@ -31,28 +31,27 @@ int main(int argc, char* argv[]) {
 
 
     const char *host = url_parts.host.c_str();
-    uint16_t port = std::stoi(url_parts.port);
-    struct sockaddr_in server_address = config::get_server_address(host, port);
+    const char *port = url_parts.port.c_str();
+    auto endpoint = config::get_server_endpoint(host, port, config);
     bool reconnect_needed = true;
     while (reconnect_needed && !finish) {
 
-    // TODO: Naley zmiień hard codowanie AF_INET
-    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int socket_fd = socket(endpoint.family, SOCK_STREAM, 0);
     if (socket_fd < 0) {
         throw std::runtime_error("Błąd podczas tworzenia gniazda: " + std::string(strerror(errno)));
     }
 
-    if (connect(socket_fd, (struct sockaddr *) &server_address,
-                (socklen_t) sizeof(server_address)) < 0) {
-        throw std::runtime_error("Błąd podczas łączenia się z serwerem: " + std::string(strerror(errno)));
+    if (connect(socket_fd,
+            reinterpret_cast<sockaddr*>(&endpoint.addr),
+            endpoint.addr_len) < 0) {
+    throw std::runtime_error("Błąd podczas łączenia się z serwerem: " + std::string(strerror(errno)));
     }
 
     std::cerr<<config::display_diagnostic_message(
-        "Połączono z serwerem " + std::string(host) + " na porcie " + std::to_string(port), 
+        "Połączono z serwerem " + std::string(host) + " na porcie " + std::string(port), 
         1, 
         config.verbosity
     );
-
 
     //NOw we have to send a GET request to the server, but first we have to prepare the request string
     std::string request = config::prepare_http_get_request(url_parts);

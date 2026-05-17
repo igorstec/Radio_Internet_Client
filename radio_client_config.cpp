@@ -140,19 +140,52 @@ namespace config
         return "GET " + url_parts.path + " HTTP/1.1\r\nHost: " + url_parts.host + "\r\n\r\n";
     }
 
-    ::sockaddr_in get_server_address(const char *host, uint16_t port) {
-        struct sockaddr_in server_address;
-        memset(&server_address, 0, sizeof(server_address));
-        server_address.sin_family = AF_INET;
-        server_address.sin_port = htons(port);
+    ResolvedEndpoint get_server_endpoint(const char *host,
+                                     const char *port,
+                                     const RadioClientConfig& config) {
+    addrinfo hints{};
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
 
-        struct hostent *he = gethostbyname(host);
-        if (he == nullptr) {
-            throw std::runtime_error("Failed to resolve host: " + std::string(host));
-        }
-        memcpy(&server_address.sin_addr, he->h_addr_list[0], he->h_length);
-        return server_address;
+    if (config.ipv4_forced && !config.ipv6_forced) {
+        hints.ai_family = AF_INET;
+    } else if (config.ipv6_forced && !config.ipv4_forced) {
+        hints.ai_family = AF_INET6;
+    } else {
+        // oba podane albo żaden niepodany -> wybierz pierwszy wynik getaddrinfo
+        hints.ai_family = AF_UNSPEC;
     }
+
+    addrinfo *result = nullptr;
+    int rc = getaddrinfo(host, port, &hints, &result);
+    if (rc != 0) {
+        throw std::runtime_error(
+            "Błąd podczas rozwiązywania adresu '" + std::string(host) +
+            ":" + std::string(port) + "': " + gai_strerror(rc)
+        );
+    }
+
+    ResolvedEndpoint endpoint{};
+
+    for (addrinfo *rp = result; rp != nullptr; rp = rp->ai_next) {
+        if (rp->ai_family != AF_INET && rp->ai_family != AF_INET6) {
+            continue;
+        }
+
+        endpoint.family = rp->ai_family;
+        endpoint.socktype = rp->ai_socktype;
+        endpoint.protocol = rp->ai_protocol;
+        endpoint.addr_len = static_cast<socklen_t>(rp->ai_addrlen);
+        std::memcpy(&endpoint.addr, rp->ai_addr, rp->ai_addrlen);
+        freeaddrinfo(result);
+        return endpoint;
+    }
+
+    freeaddrinfo(result);
+    throw std::runtime_error("Nie znaleziono poprawnego adresu IPv4/IPv6 dla hosta: " +
+                             std::string(host));
+}
+
 
 std::string display_diagnostic_message(const std::string& message, uint8_t verbosity_level, uint8_t current_verbosity) {
     if (verbosity_level <= current_verbosity) {

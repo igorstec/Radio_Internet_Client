@@ -24,6 +24,15 @@ namespace config {
         std::string path;
     };
 
+    struct ResolvedEndpoint {
+        sockaddr_storage addr{};
+        socklen_t addr_len = 0;
+        int family = AF_UNSPEC;
+        int socktype = 0;
+        int protocol = 0;
+    };
+
+
     [[nodiscard]] RadioUrlParts parse_url(std::string_view url);
     [[nodiscard]] int validate_config(const RadioClientConfig& config) noexcept;
     [[nodiscard]] RadioClientConfig parse_arguments(int argc, char* argv[]);
@@ -32,7 +41,9 @@ namespace config {
 
     std::string prepare_http_get_request(const RadioUrlParts& url_parts);
 
-    ::sockaddr_in get_server_address(const char *host, uint16_t port);
+    [[nodiscard]] ResolvedEndpoint get_server_endpoint(const char *host,
+                                                    const char *port,
+                                                    const RadioClientConfig& config);
 
     std::string display_diagnostic_message(const std::string& message, uint8_t verbosity_level, uint8_t current_verbosity);
 
