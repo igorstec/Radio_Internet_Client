@@ -74,4 +74,6 @@ void stream_audio(StreamSession& session,
                   const config::RadioClientConfig& cfg,
                   volatile sig_atomic_t& finish_flag);
 
+std::string prepare_http_get_request(const RadioUrlParts& url_parts);
+
 } // namespace http_radio

@@ -17,30 +17,41 @@ namespace config
 {
     [[nodiscard]] RadioUrlParts parse_url(std::string_view url)
     {
-        RadioUrlParts result{"", "80", "/"}; // Domyślne wartości
+        RadioUrlParts result{}; // Domyślne wartości
 
-        if (url.starts_with("http://"))
-        {
+        if (url.starts_with("https://")) {
+            result.scheme = UrlScheme::HTTPS;
+            result.port = "443";
+            url.remove_prefix(8);
+        } else if (url.starts_with("http://")) {
+            result.scheme = UrlScheme::HTTP;
+            result.port = "80";
             url.remove_prefix(7);
+        } else {
+            result.scheme = UrlScheme::HTTP;
+            result.port = "80";
         }
 
         auto path_pos = url.find('/');
-        if (path_pos != std::string_view::npos)
-        {
-            result.path = url.substr(path_pos);
+        if (path_pos != std::string_view::npos) {
+            result.path = std::string(url.substr(path_pos));
             url = url.substr(0, path_pos);
+        } else {
+            result.path = "/";
         }
 
-        auto port_pos = url.find(':');
-        if (port_pos != std::string_view::npos)
-        {
-            result.port = url.substr(port_pos + 1);
-            result.host = url.substr(0, port_pos);
+        auto port_pos = url.rfind(':');
+        if (port_pos != std::string_view::npos) {
+            result.host = std::string(url.substr(0, port_pos));
+            result.port = std::string(url.substr(port_pos + 1));
+        } else {
+            result.host = std::string(url);
         }
-        else
-        {
-            result.host = url;
+
+        if (result.host.empty()) {
+            throw std::invalid_argument("Pusty host w URL.");
         }
+
 
         return result;
     }

@@ -7,6 +7,10 @@
 
 namespace config {
 
+    enum class UrlScheme {
+        HTTP,
+        HTTPS
+    };
     struct RadioClientConfig
     {
         std::string url; // (-u) MUST EXIST
@@ -19,6 +23,7 @@ namespace config {
 
     struct RadioUrlParts
     {
+        UrlScheme scheme = UrlScheme::HTTP;
         std::string host;
         std::string port;
         std::string path;
@@ -38,8 +43,6 @@ namespace config {
     [[nodiscard]] RadioClientConfig parse_arguments(int argc, char* argv[]);
 
     uint16_t read_port(char const *string);
-
-    std::string prepare_http_get_request(const RadioUrlParts& url_parts);
 
     [[nodiscard]] ResolvedEndpoint get_server_endpoint(const char *host,
                                                     const char *port,
