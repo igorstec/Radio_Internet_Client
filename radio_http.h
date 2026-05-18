@@ -10,14 +10,13 @@
 
 #include <openssl/ssl.h>
 
-namespace http_radio {
+namespace radio_http {
 
 struct HeaderMap {
     std::map<std::string, std::string> values;
 
     std::string get(const std::string& key) const;
     void set(std::string key, std::string value);
-    bool contains(const std::string& key) const;
 };
 
 struct HttpResponseHead {
@@ -30,7 +29,6 @@ struct Cookie {
     std::string name;
     std::string value;
     std::string domain;
-    bool secure_only = false;
 };
 
 class Transport {
@@ -51,7 +49,6 @@ public:
     void write_all(const void* buffer, size_t size);
 
     int native_fd() const { return fd_; }
-    bool is_tls() const { return ssl_ != nullptr; }
     void close();
 
 private:
@@ -65,15 +62,18 @@ struct StreamSession {
     config::RadioUrlParts final_url;
     HttpResponseHead response;
     std::optional<size_t> icy_metaint;
+
+    std::vector<char> input_buffer;
+    size_t audio_bytes_until_metadata = 0;
+    size_t metadata_bytes_remaining = 0;
+    std::vector<char> metadata_buffer;
 };
 
 [[nodiscard]] StreamSession open_stream_session(const config::RadioClientConfig& cfg,
                                                 config::RadioUrlParts url);
 
-void stream_audio(StreamSession& session,
-                  const config::RadioClientConfig& cfg,
-                  volatile sig_atomic_t& finish_flag);
+void consume_available_data(StreamSession& session,
+                            const config::RadioClientConfig& cfg,
+                            bool& server_closed);
 
-std::string prepare_http_get_request(const RadioUrlParts& url_parts);
-
-} // namespace http_radio
+} // namespace radio_http

@@ -1,143 +1,128 @@
 #include "radio_client_config.h"
+#include "radio_http.h"
 
-#include <arpa/inet.h>
 #include <cerrno>
-#include <cstdarg>
-#include <cstdio>
-#include <cstdlib>
+#include <csignal>
 #include <cstring>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <exception>
 #include <iostream>
-
-#include <string>
-#include <vector>
 #include <poll.h>
+#include <string>
+#include <unistd.h>
 
-const size_t BUFFER_SIZE = 4096;
-const size_t CONNECTIONS = 2;
-static const char quit_string[] = "quit";
+namespace {
+    const size_t CONNECTIONS = 2;
+    const char quit_string[] = "quit";
 
-const size_t CLIENT_STDIN_IDX = 0;
-const size_t CLIENT_SOCKET_IDX = 1;
+    const size_t CLIENT_STDIN_IDX = 0;
+    const size_t CLIENT_SOCKET_IDX = 1;
 
-static volatile sig_atomic_t finish = 0;
+    volatile sig_atomic_t finish = 0;
+
+    void handle_sigint(int) {
+        finish = 1;
+    }
+} // namespace
 
 int main(int argc, char* argv[]) {
-    auto config = config::parse_arguments(argc, argv);
-    auto url_parts = config::parse_url(config.url);
+    try {
+        config::install_signal_handler(SIGINT, handle_sigint, SA_RESTART);
 
+        auto cfg = config::parse_arguments(argc, argv);
+        auto url = config::parse_url(cfg.url);
 
-    const char *host = url_parts.host.c_str();
-    const char *port = url_parts.port.c_str();
-    auto endpoint = config::get_server_endpoint(host, port, config);
-    bool reconnect_needed = true;
-    while (reconnect_needed && !finish) {
+        bool reconnect_needed = true;
 
-    int socket_fd = socket(endpoint.family, endpoint.socktype, endpoint.protocol);
-    if (socket_fd < 0) {
-        throw std::runtime_error("Błąd podczas tworzenia gniazda: " + std::string(strerror(errno)));
-    }
+        while (reconnect_needed && !finish) {
+            reconnect_needed = false;
 
-   if (connect(socket_fd,
-            reinterpret_cast<const sockaddr*>(&endpoint.addr),
-            endpoint.addr_len) < 0) {
-        throw std::runtime_error(
-        "Błąd podczas łączenia się z serwerem: " + std::string(strerror(errno)));
-}
+            // Otwórz sesję strumieniową (łączy się z serwerem, wysyła żądanie i odbiera nagłówki)
+            radio_http::StreamSession session = radio_http::open_stream_session(cfg, url);
 
-    std::cerr<<config::display_diagnostic_message(
-        "Połączono z serwerem " + std::string(host) + " na porcie " + std::string(port), 
-        1, 
-        config.verbosity
-    );
+            bool server_closed = false;
 
-    //NOw we have to send a GET request to the server, but first we have to prepare the request string
-    std::string request = config::prepare_http_get_request(url_parts);
+            //
+            radio_http::consume_available_data(session, cfg, server_closed);
 
-
-    pollfd poll_descriptors[CONNECTIONS];
-    // We set one descriptor for standard input and he 2 for the socket
-    poll_descriptors[CLIENT_STDIN_IDX].fd = STDIN_FILENO;
-    poll_descriptors[CLIENT_STDIN_IDX].events = POLLIN;
-    poll_descriptors[CLIENT_SOCKET_IDX].fd = socket_fd;
-    poll_descriptors[CLIENT_SOCKET_IDX].events = POLLIN;
-
-    static char buffer[BUFFER_SIZE];
-
-    // Send the GET request to the server
-    ssize_t sent_bytes = send(socket_fd, request.c_str(), request.size(), 0);
-    if (sent_bytes < 0) {
-        throw std::runtime_error("Błąd podczas wysyłania danych do serwera: " + std::string(strerror(errno)));
-    }
-
-    do{
-         for (int i = 0; i < CONNECTIONS; ++i) {
-            poll_descriptors[i].revents = 0;
-        }
-
-        // After Ctrl-C the to-server socket is closed.
-        if (finish && poll_descriptors[CLIENT_SOCKET_IDX].fd >= 0) {
-            close(poll_descriptors[CLIENT_SOCKET_IDX].fd);
-            poll_descriptors[CLIENT_SOCKET_IDX].fd = -1;
-        }
-
-        int poll_status = poll(poll_descriptors, CONNECTIONS, config.client_timeout_ms);
-        if (poll_status == -1 ) {
-            if (errno == EINTR) {
-                std::cerr << "interrupted system call\n";
+            if (server_closed) {
+                std::cerr << config::display_diagnostic_message(
+                    "server closed connection", 1, cfg.verbosity);
+                break;
             }
-            else {
-                throw std::runtime_error("Błąd podczas oczekiwania na dane: " + std::string(strerror(errno)));
-            }
-        }else if (poll_status > 0){
 
-            if (poll_descriptors[CLIENT_STDIN_IDX].fd != -1 && (poll_descriptors[CLIENT_STDIN_IDX].revents & (POLLIN | POLLERR)))
-            {
-                ssize_t received_bytes = read(poll_descriptors[CLIENT_STDIN_IDX].fd, buffer, BUFFER_SIZE - 1);
+            pollfd poll_descriptors[CONNECTIONS];
+            poll_descriptors[CLIENT_STDIN_IDX].fd = STDIN_FILENO;
+            poll_descriptors[CLIENT_STDIN_IDX].events = POLLIN;
+            poll_descriptors[CLIENT_STDIN_IDX].revents = 0;
 
-                if (received_bytes > 0)
-                {
-                    buffer[received_bytes] = '\0';
+            poll_descriptors[CLIENT_SOCKET_IDX].fd = session.transport.native_fd();
+            poll_descriptors[CLIENT_SOCKET_IDX].events = POLLIN | POLLERR | POLLHUP;
+            poll_descriptors[CLIENT_SOCKET_IDX].revents = 0;
 
-                    if (strncmp(buffer, quit_string, 4) == 0)
-                    {
+            while (!finish) {
+                poll_descriptors[CLIENT_STDIN_IDX].revents = 0;
+                poll_descriptors[CLIENT_SOCKET_IDX].revents = 0;
+
+                if (finish && poll_descriptors[CLIENT_SOCKET_IDX].fd >= 0) {
+                    session.transport.close();
+                    poll_descriptors[CLIENT_SOCKET_IDX].fd = -1;
+                }
+
+                int poll_status = poll(poll_descriptors,
+                                       CONNECTIONS,
+                                       cfg.client_timeout_ms);
+
+                if (poll_status < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    throw std::runtime_error("Błąd podczas poll(): " +
+                                             std::string(std::strerror(errno)));
+                }
+
+                if (poll_status == 0) {
+                    std::cerr << config::display_diagnostic_message(
+                        "data receiving timeout", 1, cfg.verbosity);
+                    reconnect_needed = true;
+                    break;
+                }
+
+                if (poll_descriptors[CLIENT_STDIN_IDX].revents & POLLIN) {
+                    char input[256];
+                    ssize_t n = read(STDIN_FILENO, input, sizeof(input) - 1);
+                    if (n > 0) {
+                        input[n] = '\0';
+                        if (std::strncmp(input, quit_string, 4) == 0) {
+                            finish = 1;
+                            break;
+                        }
+                    }
+                }
+
+                if (finish) {
+                    break;
+                }
+
+                if (poll_descriptors[CLIENT_SOCKET_IDX].revents & (POLLIN | POLLERR | POLLHUP)) {
+                    bool current_server_closed = false;
+                    radio_http::consume_available_data(session, cfg, current_server_closed);
+
+                    if (current_server_closed ||
+                        (poll_descriptors[CLIENT_SOCKET_IDX].revents & (POLLERR | POLLHUP))) {
+                        std::cerr << config::display_diagnostic_message(
+                            "server closed connection", 1, cfg.verbosity);
                         finish = 1;
-                        std::cerr<<config::display_diagnostic_message("Otrzymano polecenie zakończenia programu. Kończę...", 1, config.verbosity);
+                        break;
                     }
                 }
             }
-            if (poll_descriptors[CLIENT_SOCKET_IDX].fd != -1 && (poll_descriptors[CLIENT_SOCKET_IDX].revents & (POLLIN | POLLERR)))
-            {
-                ssize_t received_bytes = read(poll_descriptors[CLIENT_SOCKET_IDX].fd, buffer, BUFFER_SIZE - 1);
 
-                if (received_bytes > 0) {
-                    write(STDOUT_FILENO, buffer, received_bytes);
-                } else if (received_bytes == 0) {
-                    std::cerr << config::display_diagnostic_message("Serwer zamknął połączenie.", 1, config.verbosity);
-                    finish = 1;
-                    reconnect_needed = false;
-                } else {
-                    std::cerr << config::display_diagnostic_message("Błąd odczytu z socketu.", 1, config.verbosity);
-                    finish = 1;
-                    reconnect_needed = false;
-                }
-            }
-        }else{
-            // poll_status == 0 - timeout
-            std::cerr << config::display_diagnostic_message("Brak danych do odczytu po upływie timeoutu.", 1, config.verbosity);
-            reconnect_needed = true; 
-
-            // Wychodzimy z pętli, żeby zamknąć stare gniazdo i otworzyć nowe.
-            break;
+            session.transport.close();
         }
-    }while(!finish);
 
-    if (poll_descriptors[CLIENT_SOCKET_IDX].fd >= 0) {
-        close(poll_descriptors[CLIENT_SOCKET_IDX].fd);
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
+        return 1;
     }
-}
-    return 0;
 }

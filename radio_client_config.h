@@ -50,5 +50,6 @@ namespace config {
 
     std::string display_diagnostic_message(const std::string& message, uint8_t verbosity_level, uint8_t current_verbosity);
 
+    void install_signal_handler(int signal, void (*handler)(int), int flags);
 } // namespace config
 

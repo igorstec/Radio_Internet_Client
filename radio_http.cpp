@@ -5,7 +5,6 @@
 #include <cerrno>
 #include <cctype>
 #include <cstring>
-#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -26,120 +25,105 @@ std::string trim(std::string s) {
     return s;
 }
 
-bool host_matches_cookie_domain(const std::string& host, const std::string& domain) {
-    if (domain.empty()) {
-        return false;
+void write_all_fd(int fd, const void* data, size_t size) {
+    const char* ptr = static_cast<const char*>(data);
+    size_t left = size;
+
+    while (left > 0) {
+        ssize_t n = ::write(fd, ptr, left);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(std::string("write failed: ") + std::strerror(errno));
+        }
+        ptr += n;
+        left -= static_cast<size_t>(n);
     }
-    if (host == domain) {
-        return true;
-    }
-    if (host.size() > domain.size() &&
-        host.compare(host.size() - domain.size(), domain.size(), domain) == 0 &&
-        host[host.size() - domain.size() - 1] == '.') {
-        return true;
-    }
-    return false;
 }
 
-std::string socket_address_to_string(const config::ResolvedEndpoint& ep) {
-    char host[INET6_ADDRSTRLEN] = {};
+std::string endpoint_to_string(const config::ResolvedEndpoint& ep) {
+    char buffer[INET6_ADDRSTRLEN] = {};
+
     if (ep.family == AF_INET) {
         auto* a = reinterpret_cast<const sockaddr_in*>(&ep.addr);
-        inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host));
-        return std::string(host);
+        inet_ntop(AF_INET, &a->sin_addr, buffer, sizeof(buffer));
+        return std::string(buffer);
     }
+
     if (ep.family == AF_INET6) {
         auto* a = reinterpret_cast<const sockaddr_in6*>(&ep.addr);
-        inet_ntop(AF_INET6, &a->sin6_addr, host, sizeof(host));
-        return "[" + std::string(host) + "]";
+        inet_ntop(AF_INET6, &a->sin6_addr, buffer, sizeof(buffer));
+        return "[" + std::string(buffer) + "]";
     }
+
     return "<unknown>";
 }
 
 std::string build_get_request(const config::RadioUrlParts& url,
                               bool want_metadata,
-                              const std::optional<http_radio::Cookie>& cookie) {
-    std::string req;
-    req += "GET " + url.path + " HTTP/1.1\r\n";
-    req += "Host: " + url.host + "\r\n";
-    req += "Connection: Keep-Alive\r\n";
+                              const std::optional<radio_http::Cookie>& cookie) {
+    std::string request;
+    request += "GET " + url.path + " HTTP/1.1\r\n";
+    request += "Host: " + url.host + "\r\n";
+    request += "Connection: Keep-Alive\r\n";
     if (cookie.has_value()) {
-        req += "Cookie: " + cookie->name + "=" + cookie->value + "\r\n";
+        request += "Cookie: " + cookie->name + "=" + cookie->value + "\r\n";
     }
     if (want_metadata) {
-        req += "Icy-MetaData: 1\r\n";
+        request += "Icy-MetaData: 1\r\n";
     }
-    req += "\r\n";
-    return req;
+    request += "\r\n";
+    return request;
 }
 
-std::string read_until_double_crlf(http_radio::Transport& t, std::string& extra) {
-    std::string data = std::move(extra);
-    extra.clear();
+radio_http::HttpResponseHead parse_response_headers(const std::string& raw_headers) {
+    radio_http::HttpResponseHead result{};
 
-    char buf[4096];
-    while (data.find("\r\n\r\n") == std::string::npos) {
-        ssize_t n = t.read_some(buf, sizeof(buf));
-        if (n == 0) {
-            throw std::runtime_error("Serwer zamknął połączenie przed końcem nagłówków.");
+    const size_t first_eol = raw_headers.find("\r\n");
+    result.raw_status_line = raw_headers.substr(0, first_eol);
+
+    if (result.raw_status_line.rfind("ICY ", 0) == 0) {
+        result.status_code = std::stoi(result.raw_status_line.substr(4, 3));
+    } else if (result.raw_status_line.rfind("HTTP/", 0) == 0) {
+        const size_t sp = result.raw_status_line.find(' ');
+        if (sp == std::string::npos || sp + 4 > result.raw_status_line.size()) {
+            throw std::runtime_error("Niepoprawna linia statusu.");
         }
-        if (n < 0) {
-            throw std::runtime_error("Błąd odczytu podczas czytania nagłówków.");
-        }
-        data.append(buf, static_cast<size_t>(n));
-    }
-
-    return data;
-}
-
-http_radio::HttpResponseHead parse_headers_block(const std::string& raw_block) {
-    http_radio::HttpResponseHead out;
-
-    size_t pos = raw_block.find("\r\n");
-    out.raw_status_line = raw_block.substr(0, pos);
-
-    if (out.raw_status_line.rfind("ICY ", 0) == 0) {
-        auto code_part = out.raw_status_line.substr(4, 3);
-        out.status_code = std::stoi(code_part);
-    } else if (out.raw_status_line.rfind("HTTP/", 0) == 0) {
-        auto first_space = out.raw_status_line.find(' ');
-        if (first_space == std::string::npos || first_space + 4 > out.raw_status_line.size()) {
-            throw std::runtime_error("Niepoprawna linia statusu HTTP.");
-        }
-        out.status_code = std::stoi(out.raw_status_line.substr(first_space + 1, 3));
+        result.status_code = std::stoi(result.raw_status_line.substr(sp + 1, 3));
     } else {
-        throw std::runtime_error("Nieznana linia statusu: " + out.raw_status_line);
+        throw std::runtime_error("Nieznana linia statusu: " + result.raw_status_line);
     }
 
-    size_t line_start = pos + 2;
-    while (line_start < raw_block.size()) {
-        size_t line_end = raw_block.find("\r\n", line_start);
-        if (line_end == std::string::npos || line_end == line_start) {
+    size_t line_begin = first_eol + 2;
+    while (line_begin < raw_headers.size()) {
+        size_t line_end = raw_headers.find("\r\n", line_begin);
+        if (line_end == std::string::npos || line_end == line_begin) {
             break;
         }
 
-        std::string line = raw_block.substr(line_start, line_end - line_start);
-        size_t colon = line.find(':');
+        const std::string line = raw_headers.substr(line_begin, line_end - line_begin);
+        const size_t colon = line.find(':');
         if (colon != std::string::npos) {
             std::string key = to_lower(trim(line.substr(0, colon)));
             std::string value = trim(line.substr(colon + 1));
-            out.headers.set(std::move(key), std::move(value));
+            result.headers.set(std::move(key), std::move(value));
         }
 
-        line_start = line_end + 2;
+        line_begin = line_end + 2;
     }
 
-    return out;
+    return result;
 }
 
-config::RadioUrlParts make_absolute_redirect(const config::RadioUrlParts& base,
-                                             const std::string& location) {
+config::RadioUrlParts redirect_target(const config::RadioUrlParts& current,
+                                      const std::string& location) {
     if (location.rfind("http://", 0) == 0 || location.rfind("https://", 0) == 0) {
         return config::parse_url(location);
     }
 
-    config::RadioUrlParts next = base;
-    if (!location.empty() && location[0] == '/') {
+    config::RadioUrlParts next = current;
+    if (!location.empty() && location.front() == '/') {
         next.path = location;
     } else {
         next.path = "/" + location;
@@ -147,23 +131,25 @@ config::RadioUrlParts make_absolute_redirect(const config::RadioUrlParts& base,
     return next;
 }
 
-std::optional<http_radio::Cookie> parse_set_cookie(const std::string& line,
-                                                   const config::RadioUrlParts& current_url) {
-    if (line.empty()) {
+std::optional<radio_http::Cookie> parse_cookie(const std::string& set_cookie,
+                                               const config::RadioUrlParts& current_url) {
+    if (set_cookie.empty()) {
         return std::nullopt;
     }
 
-    http_radio::Cookie cookie;
+    radio_http::Cookie cookie;
     cookie.domain = current_url.host;
 
     size_t start = 0;
     bool first = true;
-    while (start < line.size()) {
-        size_t end = line.find(';', start);
-        std::string part = trim(line.substr(start, end == std::string::npos ? std::string::npos : end - start));
+
+    while (start < set_cookie.size()) {
+        const size_t end = set_cookie.find(';', start);
+        const std::string part = trim(set_cookie.substr(
+            start, end == std::string::npos ? std::string::npos : end - start));
 
         if (first) {
-            size_t eq = part.find('=');
+            const size_t eq = part.find('=');
             if (eq == std::string::npos) {
                 return std::nullopt;
             }
@@ -171,14 +157,12 @@ std::optional<http_radio::Cookie> parse_set_cookie(const std::string& line,
             cookie.value = trim(part.substr(eq + 1));
             first = false;
         } else {
-            std::string lower = to_lower(part);
+            const std::string lower = to_lower(part);
             if (lower.rfind("domain=", 0) == 0) {
-                cookie.domain = to_lower(trim(part.substr(7)));
-                if (!cookie.domain.empty() && cookie.domain[0] == '.') {
+                cookie.domain = trim(part.substr(7));
+                if (!cookie.domain.empty() && cookie.domain.front() == '.') {
                     cookie.domain.erase(cookie.domain.begin());
                 }
-            } else if (lower == "secure") {
-                cookie.secure_only = true;
             }
         }
 
@@ -195,66 +179,40 @@ std::optional<http_radio::Cookie> parse_set_cookie(const std::string& line,
     return cookie;
 }
 
-bool should_send_cookie(const std::optional<http_radio::Cookie>& cookie,
-                        const config::RadioUrlParts& url) {
-    if (!cookie.has_value()) {
-        return false;
+bool cookie_matches(const radio_http::Cookie& cookie, const std::string& host) {
+    if (host == cookie.domain) {
+        return true;
     }
-    if (cookie->secure_only && url.scheme != config::UrlScheme::HTTPS) {
-        return false;
+
+    if (host.size() > cookie.domain.size() &&
+        host.compare(host.size() - cookie.domain.size(), cookie.domain.size(), cookie.domain) == 0 &&
+        host[host.size() - cookie.domain.size() - 1] == '.') {
+        return true;
     }
-    return host_matches_cookie_domain(to_lower(url.host), to_lower(cookie->domain));
+
+    return false;
 }
 
-void wait_for_input(int fd, int timeout_ms) {
-    pollfd pfd{};
-    pfd.fd = fd;
-    pfd.events = POLLIN;
-
-    int rc;
-    do {
-        rc = poll(&pfd, 1, timeout_ms);
-    } while (rc < 0 && errno == EINTR);
-
-    if (rc == 0) {
-        throw std::runtime_error("data receiving timeout");
-    }
-    if (rc < 0) {
-        throw std::runtime_error(std::string("poll failed: ") + std::strerror(errno));
-    }
-}
-
-void write_all_fd(int fd, const void* data, size_t size) {
-    const char* ptr = static_cast<const char*>(data);
-    size_t left = size;
-    while (left > 0) {
-        ssize_t n = ::write(fd, ptr, left);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            throw std::runtime_error(std::string("write failed: ") + std::strerror(errno));
-        }
-        ptr += n;
-        left -= static_cast<size_t>(n);
-    }
+void log_text(const config::RadioClientConfig& cfg,
+              const std::string& text,
+              uint8_t verbosity_level = 1) {
+    std::cerr << config::display_diagnostic_message(text, verbosity_level, cfg.verbosity);
 }
 
 } // namespace
 
-namespace http_radio {
+namespace radio_http {
 
 std::string HeaderMap::get(const std::string& key) const {
     auto it = values.find(to_lower(key));
-    return it == values.end() ? "" : it->second;
+    if (it == values.end()) {
+        return "";
+    }
+    return it->second;
 }
 
 void HeaderMap::set(std::string key, std::string value) {
     values[to_lower(std::move(key))] = std::move(value);
-}
-
-bool HeaderMap::contains(const std::string& key) const {
-    return values.find(to_lower(key)) != values.end();
 }
 
 Transport::~Transport() {
@@ -280,13 +238,12 @@ Transport& Transport::operator=(Transport&& other) noexcept {
 
 void Transport::connect_to(const config::RadioUrlParts& url,
                            const config::RadioClientConfig& client_cfg) {
-    auto endpoint = config::get_server_endpoint(url.host.c_str(), url.port.c_str(), client_cfg);
+    close();
 
-    std::cerr << config::display_diagnostic_message(
-        "resolving name " + url.host, 1, client_cfg.verbosity);
-    std::cerr << config::display_diagnostic_message(
-        "connecting to server " + socket_address_to_string(endpoint) + ":" + url.port,
-        1, client_cfg.verbosity);
+    const auto endpoint = config::get_server_endpoint(url.host.c_str(), url.port.c_str(), client_cfg);
+
+    log_text(client_cfg, "resolving name " + url.host);
+    log_text(client_cfg, "connecting to server " + endpoint_to_string(endpoint) + ":" + url.port);
 
     fd_ = ::socket(endpoint.family, endpoint.socktype, endpoint.protocol);
     if (fd_ < 0) {
@@ -324,18 +281,16 @@ void Transport::connect_to(const config::RadioUrlParts& url,
 
 ssize_t Transport::read_some(void* buffer, size_t size) {
     if (ssl_) {
-        int rc = SSL_read(ssl_, buffer, static_cast<int>(size));
-        if (rc > 0) {
-            return rc;
+        const int n = SSL_read(ssl_, buffer, static_cast<int>(size));
+        if (n > 0) {
+            return n;
         }
-        int err = SSL_get_error(ssl_, rc);
+
+        const int err = SSL_get_error(ssl_, n);
         if (err == SSL_ERROR_ZERO_RETURN) {
             return 0;
         }
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-            errno = EAGAIN;
-            return -1;
-        }
+
         throw std::runtime_error("SSL_read failed");
     }
 
@@ -343,6 +298,7 @@ ssize_t Transport::read_some(void* buffer, size_t size) {
     do {
         n = ::read(fd_, buffer, size);
     } while (n < 0 && errno == EINTR);
+
     return n;
 }
 
@@ -361,6 +317,7 @@ void Transport::write_all(const void* buffer, size_t size) {
             do {
                 n = static_cast<int>(::write(fd_, ptr, left));
             } while (n < 0 && errno == EINTR);
+
             if (n < 0) {
                 throw std::runtime_error(std::string("write failed: ") + std::strerror(errno));
             }
@@ -377,10 +334,12 @@ void Transport::close() {
         SSL_free(ssl_);
         ssl_ = nullptr;
     }
+
     if (ssl_ctx_) {
         SSL_CTX_free(ssl_ctx_);
         ssl_ctx_ = nullptr;
     }
+
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
@@ -392,68 +351,80 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
     constexpr int MAX_REDIRECTS = 10;
     std::optional<Cookie> cookie;
 
-    for (int redirect_count = 0; redirect_count < MAX_REDIRECTS; ++redirect_count) {
+    for (int redirects = 0; redirects < MAX_REDIRECTS; ++redirects) {
         StreamSession session;
         session.final_url = url;
+
         session.transport.connect_to(url, cfg);
 
-        std::string request = build_get_request(url, cfg.multiplexing_enabled,
-                                                should_send_cookie(cookie, url) ? cookie : std::nullopt);
+        std::optional<Cookie> cookie_for_request;
+        if (cookie.has_value() && cookie_matches(*cookie, url.host)) {
+            cookie_for_request = cookie;
+        }
 
-        std::cerr << config::display_diagnostic_message(
-            request.substr(0, request.size() - 2), 1, cfg.verbosity);
+        const std::string request = build_get_request(url, cfg.multiplexing_enabled, cookie_for_request);
+
+        {
+            std::string printable = request;
+            printable.erase(std::remove(printable.begin(), printable.end(), '\r'), printable.end());
+            if (!printable.empty() && printable.back() == '\n') {
+                printable.pop_back();
+            }
+            log_text(cfg, printable);
+        }
 
         session.transport.write_all(request.data(), request.size());
 
-        std::string extra;
-        std::string raw = read_until_double_crlf(session.transport, extra);
-        size_t header_end = raw.find("\r\n\r\n");
-        std::string header_block = raw.substr(0, header_end);
-        std::string body_prefix = raw.substr(header_end + 4);
+        std::string raw;
+        char buf[4096];
 
-        session.response = parse_headers_block(header_block);
-
-        std::cerr << config::display_diagnostic_message(
-            session.response.raw_status_line, 1, cfg.verbosity);
-
-        for (const auto& [k, v] : session.response.headers.values) {
-            std::cerr << config::display_diagnostic_message(k + ": " + v, 1, cfg.verbosity);
+        while (raw.find("\r\n\r\n") == std::string::npos) {
+            const ssize_t n = session.transport.read_some(buf, sizeof(buf));
+            if (n <= 0) {
+                throw std::runtime_error("Serwer zamknął połączenie przed końcem nagłówków.");
+            }
+            raw.append(buf, static_cast<size_t>(n));
         }
 
-        std::string set_cookie = session.response.headers.get("set-cookie");
+        const size_t header_end = raw.find("\r\n\r\n");
+        const std::string headers_only = raw.substr(0, header_end);
+        const std::string body_prefix = raw.substr(header_end + 4);
+
+        session.response = parse_response_headers(headers_only);
+
+        log_text(cfg, session.response.raw_status_line);
+        for (const auto& [k, v] : session.response.headers.values) {
+            log_text(cfg, k + ": " + v);
+        }
+
+        const std::string set_cookie = session.response.headers.get("set-cookie");
         if (!set_cookie.empty()) {
-            auto parsed = parse_set_cookie(set_cookie, url);
-            if (parsed.has_value()) {
-                cookie = parsed;
-            }
+            cookie = parse_cookie(set_cookie, url);
         }
 
         if (session.response.status_code >= 300 && session.response.status_code < 400) {
-            std::string location = session.response.headers.get("location");
+            const std::string location = session.response.headers.get("location");
             if (location.empty()) {
                 throw std::runtime_error("Redirect bez nagłówka Location.");
             }
-            url = make_absolute_redirect(url, location);
+            url = redirect_target(url, location);
             continue;
         }
 
         if (session.response.status_code != 200) {
-            throw std::runtime_error("Serwer zwrócił kod HTTP/ICY " +
+            throw std::runtime_error("Nieobsługiwany kod odpowiedzi: " +
                                      std::to_string(session.response.status_code));
         }
 
-        std::string metaint_header = session.response.headers.get("icy-metaint");
-        if (!metaint_header.empty()) {
-            session.icy_metaint = static_cast<size_t>(std::stoul(metaint_header));
+        const std::string metaint = session.response.headers.get("icy-metaint");
+        if (!metaint.empty()) {
+            session.icy_metaint = static_cast<size_t>(std::stoul(metaint));
         }
 
-        if (!body_prefix.empty()) {
-            if (session.icy_metaint.has_value() && cfg.multiplexing_enabled) {
-                static thread_local std::string unread_prefix;
-                unread_prefix = body_prefix;
-            } else {
-                write_all_fd(STDOUT_FILENO, body_prefix.data(), body_prefix.size());
-            }
+        session.input_buffer.assign(body_prefix.begin(), body_prefix.end());
+
+        if (cfg.multiplexing_enabled && session.icy_metaint.has_value()) {
+            session.audio_bytes_until_metadata = *session.icy_metaint;
         }
 
         return session;
@@ -462,94 +433,91 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
     throw std::runtime_error("Zbyt wiele przekierowań.");
 }
 
-void stream_audio(StreamSession& session,
-                  const config::RadioClientConfig& cfg,
-                  volatile sig_atomic_t& finish_flag) {
-    char buffer[4096];
+void consume_available_data(StreamSession& session,
+                            const config::RadioClientConfig& cfg,
+                            bool& server_closed) {
+    server_closed = false;
 
-    if (!session.icy_metaint.has_value() || !cfg.multiplexing_enabled) {
-        while (!finish_flag) {
-            wait_for_input(session.transport.native_fd(), cfg.client_timeout_ms);
-            ssize_t n = session.transport.read_some(buffer, sizeof(buffer));
-            if (n == 0) {
-                return;
-            }
-            if (n < 0) {
-                if (errno == EAGAIN) {
-                    continue;
-                }
-                throw std::runtime_error("Błąd odczytu strumienia.");
-            }
-            write_all_fd(STDOUT_FILENO, buffer, static_cast<size_t>(n));
+    if (session.input_buffer.empty()) {
+        char buf[4096];
+        const ssize_t n = session.transport.read_some(buf, sizeof(buf));
+        if (n == 0) {
+            server_closed = true;
+            return;
+        }
+        if (n < 0) {
+            throw std::runtime_error("Błąd odczytu danych z połączenia.");
+        }
+        session.input_buffer.insert(session.input_buffer.end(), buf, buf + n);
+    }
+
+    if (!cfg.multiplexing_enabled || !session.icy_metaint.has_value()) {
+        if (!session.input_buffer.empty()) {
+            write_all_fd(STDOUT_FILENO,
+                         session.input_buffer.data(),
+                         session.input_buffer.size());
+            session.input_buffer.clear();
         }
         return;
     }
 
-    const size_t metaint = *session.icy_metaint;
-    std::vector<char> meta_buf(16 * 255);
+    while (!session.input_buffer.empty()) {
+        if (session.metadata_bytes_remaining > 0) {
+            const size_t chunk = std::min(session.metadata_bytes_remaining,
+                                          session.input_buffer.size());
 
-    while (!finish_flag) {
-        size_t audio_left = metaint;
-        while (audio_left > 0 && !finish_flag) {
-            wait_for_input(session.transport.native_fd(), cfg.client_timeout_ms);
-            size_t chunk = std::min(audio_left, sizeof(buffer));
-            ssize_t n = session.transport.read_some(buffer, chunk);
-            if (n == 0) {
-                return;
-            }
-            if (n < 0) {
-                if (errno == EAGAIN) {
-                    continue;
+            session.metadata_buffer.insert(session.metadata_buffer.end(),
+                                           session.input_buffer.begin(),
+                                           session.input_buffer.begin() + static_cast<std::ptrdiff_t>(chunk));
+
+            session.input_buffer.erase(session.input_buffer.begin(),
+                                       session.input_buffer.begin() + static_cast<std::ptrdiff_t>(chunk));
+
+            session.metadata_bytes_remaining -= chunk;
+
+            if (session.metadata_bytes_remaining == 0) {
+                while (!session.metadata_buffer.empty() &&
+                       session.metadata_buffer.back() == '\0') {
+                    session.metadata_buffer.pop_back();
                 }
-                throw std::runtime_error("Błąd odczytu danych audio.");
-            }
-            write_all_fd(STDOUT_FILENO, buffer, static_cast<size_t>(n));
-            audio_left -= static_cast<size_t>(n);
-        }
 
-        unsigned char meta_len_byte = 0;
-        while (!finish_flag) {
-            wait_for_input(session.transport.native_fd(), cfg.client_timeout_ms);
-            ssize_t n = session.transport.read_some(&meta_len_byte, 1);
-            if (n == 0) {
-                return;
-            }
-            if (n < 0) {
-                if (errno == EAGAIN) {
-                    continue;
+                if (!session.metadata_buffer.empty()) {
+                    write_all_fd(STDERR_FILENO,
+                                 session.metadata_buffer.data(),
+                                 session.metadata_buffer.size());
+                    write_all_fd(STDERR_FILENO, "\n", 1);
                 }
-                throw std::runtime_error("Błąd odczytu długości metadanych.");
+
+                session.metadata_buffer.clear();
+                session.audio_bytes_until_metadata = *session.icy_metaint;
             }
-            break;
+
+            continue;
         }
 
-        size_t meta_size = static_cast<size_t>(meta_len_byte) * 16;
-        size_t got = 0;
-        while (got < meta_size && !finish_flag) {
-            wait_for_input(session.transport.native_fd(), cfg.client_timeout_ms);
-            ssize_t n = session.transport.read_some(meta_buf.data() + got, meta_size - got);
-            if (n == 0) {
-                return;
+        if (session.audio_bytes_until_metadata == 0) {
+            const unsigned char len = static_cast<unsigned char>(session.input_buffer.front());
+            session.input_buffer.erase(session.input_buffer.begin());
+            session.metadata_bytes_remaining = static_cast<size_t>(len) * 16;
+
+            if (session.metadata_bytes_remaining == 0) {
+                session.audio_bytes_until_metadata = *session.icy_metaint;
             }
-            if (n < 0) {
-                if (errno == EAGAIN) {
-                    continue;
-                }
-                throw std::runtime_error("Błąd odczytu metadanych.");
-            }
-            got += static_cast<size_t>(n);
+            continue;
         }
 
-        if (meta_size > 0) {
-            while (meta_size > 0 && meta_buf[meta_size - 1] == '\0') {
-                --meta_size;
-            }
-            if (meta_size > 0) {
-                write_all_fd(STDERR_FILENO, meta_buf.data(), meta_size);
-                write_all_fd(STDERR_FILENO, "\n", 1);
-            }
-        }
+        const size_t chunk = std::min(session.audio_bytes_until_metadata,
+                                      session.input_buffer.size());
+
+        write_all_fd(STDOUT_FILENO,
+                     session.input_buffer.data(),
+                     chunk);
+
+        session.input_buffer.erase(session.input_buffer.begin(),
+                                   session.input_buffer.begin() + static_cast<std::ptrdiff_t>(chunk));
+
+        session.audio_bytes_until_metadata -= chunk;
     }
 }
 
-} // namespace http_radio
+} // namespace radio_http

@@ -12,7 +12,9 @@
 #include <cstdarg>
 #include <arpa/inet.h> 
 #include <netinet/in.h>
-
+#include <stdexcept>
+#include <algorithm>
+#include <signal.h>
 namespace config
 {
     [[nodiscard]] RadioUrlParts parse_url(std::string_view url)
@@ -204,5 +206,20 @@ std::string display_diagnostic_message(const std::string& message, uint8_t verbo
     }
     return message;
 }
+
+void install_signal_handler(int signal, void (*handler)(int), int flags) {
+    struct sigaction action;
+    sigset_t block_mask;
+
+    sigemptyset(&block_mask);
+    action.sa_handler = handler;
+    action.sa_mask = block_mask;
+    action.sa_flags = flags;
+
+    if (sigaction(signal, &action, NULL) < 0) {
+        throw std::runtime_error("Nie można zainstalować handlera sygnału: " + std::string(strerror(errno)));
+    }
+}
+
 
 } // namespace config
