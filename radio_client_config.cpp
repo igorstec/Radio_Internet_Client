@@ -15,6 +15,20 @@
 #include <stdexcept>
 #include <algorithm>
 #include <signal.h>
+#include <string_view>
+
+namespace {
+
+void display_diagnostic_message(std::ostream& out,
+                                const std::string_view message,
+                                uint8_t level,
+                                uint8_t current_verbosity) {
+    if (current_verbosity >= level) {
+        out << message << '\n';
+    }
+}
+
+} // namespace
 namespace config
 {
     [[nodiscard]] RadioUrlParts parse_url(std::string_view url)
@@ -51,7 +65,7 @@ namespace config
         }
 
         if (result.host.empty()) {
-            throw std::invalid_argument("Pusty host w URL.");
+            throw std::invalid_argument("Błąd: Host w URL nie może być pusty.\n");
         }
 
 
@@ -62,17 +76,20 @@ namespace config
     {
         if (config.url.empty())
         {
-            std::cerr << "Błąd: Parametr obowiązkowy -u (url) nie został podany.\n";
+            // Niezalenie do verbosity bo informacje o błędnym wywołaniu (błędnych parametrach) powinny być zawsze wyświetlane
+            throw std::invalid_argument("Błąd: Parametr obowiązkowy -u (url) nie został podany.\n");
             return 1;
         }
         if (config.client_timeout_ms < 100 || config.client_timeout_ms > 100000)
         {
-            std::cerr << "Błąd: Timeout musi być w przedziale [100, 100000].\n";
+            // Niezalenie do verbosity bo informacje o błędnym wywołaniu (błędnych parametrach) powinny być zawsze wyświetlane
+            throw std::invalid_argument("Błąd: Timeout musi być w przedziale [100, 100000].\n");
             return 1;
         }
         if (config.verbosity > 4)
         {
-            std::cerr << "Błąd: Verbosity musi być w przedziale [0, 4].\n";
+            // Niezalenie do verbosity bo informacje o błędnym wywołaniu (błędnych parametrach) powinny być zawsze wyświetlane
+            throw std::invalid_argument("Błąd: Verbosity musi być w przedziale [0, 4].\n");
             return 1;
         }
         return 0; // Wszystko OK
@@ -109,8 +126,7 @@ namespace config
                 config.verbosity = 0; // Skrót dla parametru -v0
                 break;
             case '?':
-                std::cerr << "Użycie: " << argv[0] << " -u url [-m] [-t timeout] [-4] [-6] [-v verbosity] [-q]\n";
-                throw std::invalid_argument("Nieprawidłowe argumenty");
+                throw std::invalid_argument("Użycie: " + std::string(argv[0]) + " -u url [-m] [-t timeout] [-4] [-6] [-v verbosity] [-q]\n");
                 break;
             default:
                 abort(); // Nie powinno się zdarzyć
@@ -119,23 +135,25 @@ namespace config
 
         if (config.url.empty())
         {
-            std::cerr << "Błąd: Parametr obowiązkowy -u (url) nie został podany.\n";
-            throw std::invalid_argument("Brak wymaganego parametru -u");
+            throw std::invalid_argument("Błąd: Parametr obowiązkowy -u (url) nie został podany.\n");
         }
 
         if (validate_config(config) != 0)
         {
-            std::cerr << "Błąd: Nieprawidłowa konfiguracja.\n";
-            throw std::invalid_argument("Nieprawidłowa konfiguracja");
+            throw std::invalid_argument("Błąd: Nieprawidłowa konfiguracja.\n");
         }
+        if (config.verbosity >= VERBOSITY_DEBUG) {
+            std::string message;
+            message += "=== Konfiguracja klienta ===\n";
+            message += "URL: " + config.url + "\n";
+            message += "Multiplex: " + std::string(config.multiplexing_enabled ? "TAK" : "NIE") + "\n";
+            message += "Timeout: " + std::to_string(config.client_timeout_ms) + " ms\n";
+            message += "Wymuś IPv4: " + std::string(config.ipv4_forced ? "TAK" : "NIE") + "\n";
+            message += "Wymuś IPv6: " + std::string(config.ipv6_forced ? "TAK" : "NIE") + "\n";
+            message += "Verbosity: " + std::to_string(config.verbosity);
 
-        std::cout << "--- Konfiguracja klienta ---\n";
-        std::cout << "URL: " << config.url << "\n";
-        std::cout << "Multiplex: " << (config.multiplexing_enabled ? "TAK" : "NIE") << "\n";
-        std::cout << "Timeout: " << config.client_timeout_ms << " ms\n";
-        std::cout << "Wymuś IPv4: " << (config.ipv4_forced ? "TAK" : "NIE") << "\n";
-        std::cout << "Wymuś IPv6: " << (config.ipv6_forced ? "TAK" : "NIE") << "\n";
-        std::cout << "Verbosity: " << config.verbosity << "\n";
+            log_debug(message, config.verbosity);
+        }
         return config;
     };
 
@@ -199,12 +217,20 @@ namespace config
                              std::string(host));
 }
 
+void log_comm(std::string_view message, const uint8_t verbosity) {
+    display_diagnostic_message(std::cerr, message, VERBOSITY_COMMUNICATION, verbosity);
+}
 
-std::string display_diagnostic_message(const std::string& message, uint8_t verbosity_level, uint8_t current_verbosity) {
-    if (verbosity_level <= current_verbosity) {
-        std::cout << message << std::endl;
-    }
-    return message;
+void log_critical(std::string_view message, const uint8_t verbosity) {
+    display_diagnostic_message(std::cerr, message, VERBOSITY_CRITICAL, verbosity);
+}
+
+void log_noncritical(std::string_view message, const uint8_t verbosity) {
+    display_diagnostic_message(std::cerr, message, VERBOSITY_NONCRITICAL, verbosity);
+}
+
+void log_debug(std::string_view message, const uint8_t verbosity) {
+    display_diagnostic_message(std::cerr, message, VERBOSITY_DEBUG, verbosity);
 }
 
 void install_signal_handler(int signal, void (*handler)(int), int flags) {

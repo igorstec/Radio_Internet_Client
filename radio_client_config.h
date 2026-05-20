@@ -48,7 +48,15 @@ namespace config {
                                                     const char *port,
                                                     const RadioClientConfig& config);
 
-    std::string display_diagnostic_message(const std::string& message, uint8_t verbosity_level, uint8_t current_verbosity);
+    constexpr uint8_t VERBOSITY_COMMUNICATION = 1;
+    constexpr uint8_t VERBOSITY_CRITICAL = 2;
+    constexpr uint8_t VERBOSITY_NONCRITICAL = 3;
+    constexpr uint8_t VERBOSITY_DEBUG = 4;
+
+    void log_comm(std::string_view message, const uint8_t verbosity);
+    void log_critical(std::string_view message, const uint8_t verbosity);
+    void log_noncritical(std::string_view message, const uint8_t verbosity);
+    void log_debug(std::string_view message, const uint8_t verbosity);
 
     void install_signal_handler(int signal, void (*handler)(int), int flags);
 } // namespace config

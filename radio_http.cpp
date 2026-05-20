@@ -193,12 +193,6 @@ bool cookie_matches(const radio_http::Cookie& cookie, const std::string& host) {
     return false;
 }
 
-void log_text(const config::RadioClientConfig& cfg,
-              const std::string& text,
-              uint8_t verbosity_level = 1) {
-    std::cerr << config::display_diagnostic_message(text, verbosity_level, cfg.verbosity);
-}
-
 } // namespace
 
 namespace radio_http {
@@ -242,8 +236,8 @@ void Transport::connect_to(const config::RadioUrlParts& url,
 
     const auto endpoint = config::get_server_endpoint(url.host.c_str(), url.port.c_str(), client_cfg);
 
-    log_text(client_cfg, "resolving name " + url.host);
-    log_text(client_cfg, "connecting to server " + endpoint_to_string(endpoint) + ":" + url.port);
+    config::log_comm("resolving name " + url.host, client_cfg.verbosity);
+    config::log_comm("connecting to server " + endpoint_to_string(endpoint) + ":" + url.port, client_cfg.verbosity);
 
     fd_ = ::socket(endpoint.family, endpoint.socktype, endpoint.protocol);
     if (fd_ < 0) {
@@ -273,9 +267,11 @@ void Transport::connect_to(const config::RadioUrlParts& url,
         SSL_set_tlsext_host_name(ssl_, url.host.c_str());
         SSL_set_fd(ssl_, fd_);
 
+        config::log_debug("starting TLS handshake with " + url.host, client_cfg.verbosity);
         if (SSL_connect(ssl_) != 1) {
             throw std::runtime_error("SSL_connect failed");
         }
+        config::log_debug("TLS handshake completed", client_cfg.verbosity);
     }
 }
 
@@ -370,7 +366,7 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
             if (!printable.empty() && printable.back() == '\n') {
                 printable.pop_back();
             }
-            log_text(cfg, printable);
+            config::log_debug(printable, cfg.verbosity);
         }
 
         session.transport.write_all(request.data(), request.size());
@@ -392,14 +388,21 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
 
         session.response = parse_response_headers(headers_only);
 
-        log_text(cfg, session.response.raw_status_line);
+        config::log_debug(session.response.raw_status_line, cfg.verbosity);
         for (const auto& [k, v] : session.response.headers.values) {
-            log_text(cfg, k + ": " + v);
+            config::log_debug(k + ": " + v, cfg.verbosity);
         }
 
         const std::string set_cookie = session.response.headers.get("set-cookie");
         if (!set_cookie.empty()) {
             cookie = parse_cookie(set_cookie, url);
+
+            if (cookie.has_value()) {
+                config::log_debug("stored cookie " + cookie->name +
+                                  " for domain " + cookie->domain, cfg.verbosity);
+            } else {
+                config::log_noncritical("ignoring malformed Set-Cookie header", cfg.verbosity);
+            }
         }
 
         if (session.response.status_code >= 300 && session.response.status_code < 400) {
@@ -407,6 +410,8 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
             if (location.empty()) {
                 throw std::runtime_error("Redirect bez nagłówka Location.");
             }
+
+            config::log_debug("redirecting to " + location, cfg.verbosity);
             url = redirect_target(url, location);
             continue;
         }
@@ -419,6 +424,9 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
         const std::string metaint = session.response.headers.get("icy-metaint");
         if (!metaint.empty()) {
             session.icy_metaint = static_cast<size_t>(std::stoul(metaint));
+            config::log_debug("parsed icy-metaint=" + std::to_string(*session.icy_metaint), cfg.verbosity);
+        } else if (cfg.multiplexing_enabled) {
+            config::log_noncritical("server ignored Icy-MetaData request", cfg.verbosity);
         }
 
         session.input_buffer.assign(body_prefix.begin(), body_prefix.end());
