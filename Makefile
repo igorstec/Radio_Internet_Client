@@ -1,5 +1,5 @@
 CXX := g++
-CXXFLAGS := -Wall -Wextra -O2 -std=c++17
+CXXFLAGS := -Wall -Wextra -std=c++17 -I/opt/homebrew/opt/openssl@3/include
 LDFLAGS =
 
 TARGETS = sikradio test_url 
