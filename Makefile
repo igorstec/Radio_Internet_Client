@@ -1,28 +1,31 @@
-CXX := g++
-CXXFLAGS := -Wall -Wextra -std=c++17 -I/opt/homebrew/opt/openssl@3/include
-LDFLAGS =
+TARGET := sikradio
+CXX ?= g++
+PKG_CONFIG ?= pkg-config
 
-TARGETS = sikradio test_url 
+SRCS := radio_client.cpp radio_client_config.cpp radio_http.cpp
+OBJS := $(SRCS:.cpp=.o)
 
-# g++ -MM *.cpp
+CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wpedantic -O2
 
-.PHONY : all clean
+OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
+OPENSSL_LIBS   := $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null)
 
-all: $(TARGETS)
+ifeq ($(strip $(OPENSSL_LIBS)),)
+OPENSSL_LIBS := -lssl -lcrypto
+endif
 
-#zaleznosci
-radio_client.o: radio_client.cpp radio_client_config.h
-radio_client_config.o: radio_client_config.cpp radio_client_config.h
-test_url.o: test_url.cpp radio_client_config.h
+CPPFLAGS += $(OPENSSL_CFLAGS)
+LDLIBS   += $(OPENSSL_LIBS)
 
+all: $(TARGET)
 
-radio_client.o: radio_client.cpp radio_client_config.h
-	$(CXX) $(CXXFLAGS) -c radio_client.cpp
-sikradio: main.o parser.o sieci.o radio_client.o
-	$(CXX) $(CXXFLAGS) -o sikradio main.o parser.o sieci.o radio_client.o
+$(TARGET): $(OBJS)
+	$(CXX) $(CXXFLAGS) $(OBJS) -o $@ $(LDLIBS)
 
-test_url: test_url.o radio_client_config.o
-	$(CXX) $(CXXFLAGS) -o test_url test_url.o radio_client_config.o
+%.o: %.cpp radio_client_config.h radio_http.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-clean: 
-	rm -f $(TARGETS) *.o
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+.PHONY: all clean
