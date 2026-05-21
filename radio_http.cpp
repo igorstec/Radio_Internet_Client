@@ -505,11 +505,17 @@ void consume_available_data(StreamSession& session,
             session.metadata_bytes_remaining -= chunk;
 
             if (session.metadata_bytes_remaining == 0) {
-                // Wypisujemy dokłądnie to, co otrzymaliśmy (z paddingiem \0), bez dodawania \n.
+                // Usuwamy padding \0 i dodajemy znak nowej linii. (forum)
+                while (!session.metadata_buffer.empty() &&
+                       session.metadata_buffer.back() == '\0') {
+                    session.metadata_buffer.pop_back();
+                }
+
                 if (!session.metadata_buffer.empty()) {
                     write_all_fd(STDERR_FILENO,
                                  session.metadata_buffer.data(),
                                  session.metadata_buffer.size());
+                    write_all_fd(STDERR_FILENO, "\n", 1);
                 }
 
                 session.metadata_buffer.clear();
@@ -545,10 +551,15 @@ void consume_available_data(StreamSession& session,
 }
 
 void flush_remaining_metadata(StreamSession& session) {
+    while (!session.metadata_buffer.empty() && session.metadata_buffer.back() == '\0') {
+        session.metadata_buffer.pop_back();
+    }
+    
     if (!session.metadata_buffer.empty()) {
         write_all_fd(STDERR_FILENO, 
                      session.metadata_buffer.data(), 
                      session.metadata_buffer.size());
+        write_all_fd(STDERR_FILENO, "\n", 1);
         session.metadata_buffer.clear();
     }
 }
