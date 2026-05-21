@@ -10,10 +10,11 @@
 #include <string>
 #include <unistd.h>
 #include <string_view>
+#include <chrono>
 
 namespace {
     const size_t CONNECTIONS = 2;
-    const char quit_string[] = "quit\n";
+    const char quit_string[] = "quit";
 
     const size_t CLIENT_STDIN_IDX = 0;
     const size_t CLIENT_SOCKET_IDX = 1;
@@ -47,6 +48,10 @@ int main(int argc, char* argv[]) {
             // Otwórz sesję strumieniową (łączy się z serwerem, wysyła żądanie i odbiera nagłówki)
             radio_http::StreamSession session = radio_http::open_stream_session(cfg, url);
 
+            if (!session.input_buffer.empty()) {
+                radio_http::consume_available_data(session, cfg, false);
+            }
+
             pollfd poll_descriptors[CONNECTIONS];
             poll_descriptors[CLIENT_STDIN_IDX].fd = STDIN_FILENO;
             poll_descriptors[CLIENT_STDIN_IDX].events = POLLIN;
@@ -57,14 +62,28 @@ int main(int argc, char* argv[]) {
             poll_descriptors[CLIENT_SOCKET_IDX].revents = 0;
 
             std::string stdin_buffer;
-            
+            auto last_socket_data = std::chrono::steady_clock::now();
+
             while (!finish) {
                 poll_descriptors[CLIENT_STDIN_IDX].revents = 0;
                 poll_descriptors[CLIENT_SOCKET_IDX].revents = 0;
 
+                // Obliczanie pozostałego czasu do timeoutu na podstawie ostatniego odebranego bajtu z gniazda.
+                auto now = std::chrono::steady_clock::now();
+                auto deadline = last_socket_data + std::chrono::milliseconds(cfg.client_timeout_ms);
+                auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+
+                // Timeout
+                if (remaining_ms <= 0) {
+                    config::log_comm("data receiving timeout", cfg.verbosity);
+                    config::log_debug("reconnecting after timeout", cfg.verbosity);
+                    reconnect_needed = true;
+                    break;
+                }
+
                 int poll_status = poll(poll_descriptors,
                                        CONNECTIONS,
-                                       cfg.client_timeout_ms);
+                                       static_cast<int>(remaining_ms));
 
                 if (poll_status < 0) {
                     if (errno == EINTR) {
@@ -76,10 +95,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (poll_status == 0) {
-                    config::log_comm("data receiving timeout", cfg.verbosity);
-                    config::log_debug("reconnecting after timeout", cfg.verbosity);
-                    reconnect_needed = true;
-                    break;
+                    continue;
                 }
 
                 if (poll_descriptors[CLIENT_STDIN_IDX].revents & POLLIN) {
@@ -105,7 +121,7 @@ int main(int argc, char* argv[]) {
                             stdin_buffer.erase(0, pos + 1);
 
                             // Sprawdzamy, czy linia to dokładnie słowo "quit"
-                            if (line == "quit") {
+                            if (line == quit_string) {
                                 config::log_debug("received quit command", cfg.verbosity);
                                 finish = 1;
                                 break;
@@ -126,12 +142,14 @@ int main(int argc, char* argv[]) {
                 if (finish) {
                     break;
                 }
-
                 if (poll_descriptors[CLIENT_SOCKET_IDX].revents & (POLLIN | POLLERR | POLLHUP)) {
-                    bool current_server_closed = false;
-                    radio_http::consume_available_data(session, cfg, current_server_closed);
+                    auto received_new_socket_data = radio_http::consume_available_data(session, cfg, true);
 
-                    if (current_server_closed) {
+                    if (received_new_socket_data.received_new_bytes) {
+                        last_socket_data = std::chrono::steady_clock::now();
+                    }
+
+                    if (received_new_socket_data.server_closed) {
                         config::log_debug("server closed connection", cfg.verbosity);
                         finish = 1;
                         break;
@@ -147,10 +165,9 @@ int main(int argc, char* argv[]) {
             
             // 1. Zabezpieczenie przed ucięciem body_prefix (audio/metadane pobrane przy nagłówkach)
             if (!session.input_buffer.empty()) {
-                bool dummy_closed = false;
                 // Wywołanie consume_available_data gdy input_buffer nie jest pusty, 
                 // gwarantuje zdemultipleksowanie i wypisanie resztek na STDOUT bez czytania z gniazda.
-                radio_http::consume_available_data(session, cfg, dummy_closed);
+                radio_http::consume_available_data(session, cfg, false);
             }
 
             // 2. Wypisanie "dotychczas odebranych" resztek metadanych przed zamknięciem strumienia

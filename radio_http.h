@@ -13,9 +13,10 @@
 namespace radio_http {
 
 struct HeaderMap {
-    std::map<std::string, std::string> values;
+    std::multimap<std::string, std::string> values;
 
     std::string get(const std::string& key) const;
+    std::vector<std::string> get_all(const std::string& key) const;
     void set(std::string key, std::string value);
 };
 
@@ -69,12 +70,17 @@ struct StreamSession {
     std::vector<char> metadata_buffer;
 };
 
+struct ConsumeResult {
+    bool server_closed = false;
+    bool received_new_bytes = false;
+};
+
 [[nodiscard]] StreamSession open_stream_session(const config::RadioClientConfig& cfg,
                                                 config::RadioUrlParts url);
 
-void consume_available_data(StreamSession& session,
-                            const config::RadioClientConfig& cfg,
-                            bool& server_closed);
+ConsumeResult consume_available_data(StreamSession& session,
+                                     const config::RadioClientConfig& cfg,
+                                     bool attempt_read = true);
 
 void flush_remaining_metadata(StreamSession& session);
 

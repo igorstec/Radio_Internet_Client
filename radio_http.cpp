@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <unistd.h>
+#include <poll.h>
 
 namespace {
 
@@ -63,33 +64,133 @@ std::string endpoint_to_string(const config::ResolvedEndpoint& ep) {
     return "<unknown>";
 }
 
-std::string build_get_request(const config::RadioUrlParts& url,
-                              bool want_metadata,
-                              const std::optional<radio_http::Cookie>& cookie) {
-    std::string request;
-    request += "GET " + url.path + " HTTP/1.1\r\n";
-    request += "Host: " + url.host + "\r\n";
-    request += "Connection: Keep-Alive\r\n";
-    if (cookie.has_value()) {
-        request += "Cookie: " + cookie->name + "=" + cookie->value + "\r\n";
+std::string strip_ipv6_uri_brackets(std::string_view host) {
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+        return std::string(host.substr(1, host.size() - 2));
     }
-    if (want_metadata) {
-        request += "Icy-MetaData: 1\r\n";
-    }
-    request += "\r\n";
-    return request;
+    return std::string(host);
 }
 
-radio_http::HttpResponseHead parse_response_headers(const std::string& raw_headers) {
+bool is_default_port(const config::RadioUrlParts& url) {
+    return (url.scheme == config::UrlScheme::HTTP && url.port == "80") ||
+           (url.scheme == config::UrlScheme::HTTPS && url.port == "443");
+}
+
+std::string format_host_header_authority(const config::RadioUrlParts& url) {
+    std::string host = url.host;
+
+    const bool bracketed_ipv6 =
+        host.size() >= 2 && host.front() == '[' && host.back() == ']';
+
+    const bool bare_ipv6 =
+        !bracketed_ipv6 && host.find(':') != std::string::npos;
+
+    if (bare_ipv6) {
+        host = "[" + host + "]";
+    }
+
+    if (!is_default_port(url)) {
+        host += ":" + url.port;
+    }
+
+    return host;
+}
+
+struct HeaderReadResult { 
+    std::string headers_only; 
+    std::string body_prefix; 
+};
+
+std::pair<std::size_t, std::size_t> find_header_terminator(const std::string& raw) {
+    const std::size_t crlf = raw.find("\r\n\r\n");
+    if (crlf != std::string::npos) {
+        return {crlf, 4};
+    }
+
+    const std::size_t lf = raw.find("\n\n");
+    if (lf != std::string::npos) {
+        return {lf, 2};
+    }
+
+    return {std::string::npos, 0};
+}
+
+HeaderReadResult read_response_head(radio_http::Transport& transport, size_t max_size) {
+    std::string raw;
+    char buf[4096];
+
+    while (true) {
+        // 1. Użycie Twojej funkcji sprawdzającej koniec nagłówków! (C++17 structured binding)
+        auto [term_pos, term_len] = find_header_terminator(raw);
+        if (term_pos != std::string::npos) {
+            break; // Mamy całe nagłówki, przerywamy pętlę!
+        }
+
+        struct pollfd pfd[2];
+        pfd[0].fd = STDIN_FILENO;
+        pfd[0].events = POLLIN;
+        pfd[0].revents = 0;
+        pfd[1].fd = transport.native_fd();
+        pfd[1].events = POLLIN;
+        pfd[1].revents = 0;
+
+        int pret = ::poll(pfd, 2, 200);
+        if (pret < 0 && errno == EINTR) continue;
+
+        if (pret > 0 && (pfd[0].revents & POLLIN)) {
+            char sbuf[256];
+            ssize_t sn = ::read(STDIN_FILENO, sbuf, sizeof(sbuf));
+            if (sn > 0) {
+                std::string s(sbuf, sn);
+                if (s.find("quit") != std::string::npos) {
+                    exit(0); 
+                }
+            }
+        }
+
+        if (pret > 0 && (pfd[1].revents & (POLLIN | POLLERR | POLLHUP))) {
+            const ssize_t n = transport.read_some(buf, sizeof(buf));
+            if (n <= 0) {
+                throw std::runtime_error("Serwer zamknął połączenie przed końcem nagłówków.");
+            }
+            
+            raw.append(buf, static_cast<size_t>(n));
+            
+            if (raw.size() > max_size) {
+                throw std::runtime_error("Przekroczono maksymalny rozmiar nagłówków HTTP.");
+            }
+        }
+    }
+
+    // 2. Ponowne, czyste użycie funkcji do wyciągnięcia metadanych
+    auto [header_end, header_len] = find_header_terminator(raw);
+
+    HeaderReadResult res;
+    res.headers_only = raw.substr(0, header_end);
+    res.body_prefix = raw.substr(header_end + header_len);
+    
+    return res;
+}
+
+radio_http::HttpResponseHead parse_response_headers_relaxed(const std::string& raw_headers) {
     radio_http::HttpResponseHead result{};
 
-    const size_t first_eol = raw_headers.find("\r\n");
-    result.raw_status_line = raw_headers.substr(0, first_eol);
+    const std::size_t first_eol = raw_headers.find('\n');
+    const std::size_t status_len =
+        (first_eol == std::string::npos) ? raw_headers.size() : first_eol;
+
+    result.raw_status_line = raw_headers.substr(0, status_len);
+    if (!result.raw_status_line.empty() && result.raw_status_line.back() == '\r') {
+        result.raw_status_line.pop_back();
+    }
 
     if (result.raw_status_line.rfind("ICY ", 0) == 0) {
+        if (result.raw_status_line.size() < 7) {
+            throw std::runtime_error("Niepoprawna linia statusu.");
+        }
         result.status_code = std::stoi(result.raw_status_line.substr(4, 3));
     } else if (result.raw_status_line.rfind("HTTP/", 0) == 0) {
-        const size_t sp = result.raw_status_line.find(' ');
+        const std::size_t sp = result.raw_status_line.find(' ');
         if (sp == std::string::npos || sp + 4 > result.raw_status_line.size()) {
             throw std::runtime_error("Niepoprawna linia statusu.");
         }
@@ -98,25 +199,59 @@ radio_http::HttpResponseHead parse_response_headers(const std::string& raw_heade
         throw std::runtime_error("Nieznana linia statusu: " + result.raw_status_line);
     }
 
-    size_t line_begin = first_eol + 2;
+    if (first_eol == std::string::npos) {
+        return result;
+    }
+
+    std::size_t line_begin = first_eol + 1;
     while (line_begin < raw_headers.size()) {
-        size_t line_end = raw_headers.find("\r\n", line_begin);
-        if (line_end == std::string::npos || line_end == line_begin) {
-            break;
+        std::size_t line_end = raw_headers.find('\n', line_begin);
+        if (line_end == std::string::npos) {
+            line_end = raw_headers.size();
         }
 
-        const std::string line = raw_headers.substr(line_begin, line_end - line_begin);
-        const size_t colon = line.find(':');
-        if (colon != std::string::npos) {
-            std::string key = to_lower(trim(line.substr(0, colon)));
-            std::string value = trim(line.substr(colon + 1));
-            result.headers.set(std::move(key), std::move(value));
+        std::string line = raw_headers.substr(line_begin, line_end - line_begin);
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
         }
 
-        line_begin = line_end + 2;
+        if (!line.empty()) {
+            const std::size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                std::string key = to_lower(trim(line.substr(0, colon)));
+                std::string value = trim(line.substr(colon + 1));
+                result.headers.set(std::move(key), std::move(value));
+            }
+        }
+
+        line_begin = line_end + 1;
     }
 
     return result;
+}
+
+std::string build_get_request(const config::RadioUrlParts& url,
+                              bool want_metadata,
+                              const std::vector<radio_http::Cookie>& cookies) {
+    std::string request;
+    request += "GET " + url.path + " HTTP/1.1\r\n";
+    request += "Host: " + format_host_header_authority(url) + "\r\n";
+    request += "Connection: Keep-Alive\r\n";
+    
+    if (!cookies.empty()) {
+        request += "Cookie: ";
+        for (size_t i = 0; i < cookies.size(); ++i) {
+            request += cookies[i].name + "=" + cookies[i].value;
+            if (i + 1 < cookies.size()) request += "; ";
+        }
+        request += "\r\n";
+    }
+    
+    if (want_metadata) {
+        request += "Icy-MetaData: 1\r\n";
+    }
+    request += "\r\n";
+    return request;
 }
 
 config::RadioUrlParts redirect_target(const config::RadioUrlParts& current,
@@ -208,8 +343,17 @@ std::string HeaderMap::get(const std::string& key) const {
     return it->second;
 }
 
+std::vector<std::string> HeaderMap::get_all(const std::string& key) const {
+    std::vector<std::string> result;
+    auto range = values.equal_range(to_lower(key));
+    for (auto it = range.first; it != range.second; ++it) {
+        result.push_back(it->second);
+    }
+    return result;
+}
+
 void HeaderMap::set(std::string key, std::string value) {
-    values[to_lower(std::move(key))] = std::move(value);
+    values.insert({to_lower(std::move(key)), std::move(value)});
 }
 
 Transport::~Transport() {
@@ -237,7 +381,9 @@ void Transport::connect_to(const config::RadioUrlParts& url,
                            const config::RadioClientConfig& client_cfg) {
     close();
 
-    const auto endpoint = config::get_server_endpoint(url.host.c_str(), url.port.c_str(), client_cfg);
+    std::string bare_host = strip_ipv6_uri_brackets(url.host);
+
+    const auto endpoint = config::get_server_endpoint(bare_host.c_str(), url.port.c_str(), client_cfg);
 
     if (client_cfg.verbosity >= config::VERBOSITY_COMMUNICATION) {
         auto now = std::chrono::system_clock::now();
@@ -249,7 +395,7 @@ void Transport::connect_to(const config::RadioUrlParts& url,
         config::log_comm(time_buf, client_cfg.verbosity);
     }
     
-    config::log_comm("resolving name " + url.host, client_cfg.verbosity);
+    config::log_comm("resolving name " + bare_host, client_cfg.verbosity);
     config::log_comm("connecting to server " + endpoint_to_string(endpoint) + ":" + url.port, client_cfg.verbosity);
 
     fd_ = ::socket(endpoint.family, endpoint.socktype, endpoint.protocol);
@@ -277,10 +423,10 @@ void Transport::connect_to(const config::RadioUrlParts& url,
             throw std::runtime_error("SSL_new failed");
         }
 
-        SSL_set_tlsext_host_name(ssl_, url.host.c_str());
+        SSL_set_tlsext_host_name(ssl_, bare_host.c_str());
         SSL_set_fd(ssl_, fd_);
 
-        config::log_debug("starting TLS handshake with " + url.host, client_cfg.verbosity);
+        config::log_debug("starting TLS handshake with " + bare_host, client_cfg.verbosity);
         if (SSL_connect(ssl_) != 1) {
             throw std::runtime_error("SSL_connect failed");
         }
@@ -358,7 +504,7 @@ void Transport::close() {
 StreamSession open_stream_session(const config::RadioClientConfig& cfg,
                                   config::RadioUrlParts url) {
     constexpr int MAX_REDIRECTS = 10;
-    std::optional<Cookie> cookie;
+    std::vector<Cookie> cookies;
 
     for (int redirects = 0; redirects < MAX_REDIRECTS; ++redirects) {
         StreamSession session;
@@ -366,12 +512,14 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
 
         session.transport.connect_to(url, cfg);
 
-        std::optional<Cookie> cookie_for_request;
-        if (cookie.has_value() && cookie_matches(*cookie, url.host)) {
-            cookie_for_request = cookie;
+        std::vector<Cookie> cookies_for_request;
+        for (const auto& c : cookies) {
+            if (cookie_matches(c, url.host)) {
+                cookies_for_request.push_back(c);
+            }
         }
 
-        const std::string request = build_get_request(url, cfg.multiplexing_enabled, cookie_for_request);
+        const std::string request = build_get_request(url, cfg.multiplexing_enabled, cookies_for_request);
 
         {
             std::string printable = request;
@@ -387,26 +535,14 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
         session.transport.write_all(request.data(), request.size());
 
         std::string raw;
-        char buf[4096];
 
-        while (raw.find("\r\n\r\n") == std::string::npos) {
-            const ssize_t n = session.transport.read_some(buf, sizeof(buf));
-            if (n <= 0) {
-                throw std::runtime_error("Serwer zamknął połączenie przed końcem nagłówków.");
-            }
-            raw.append(buf, static_cast<size_t>(n));
-            
-            // Zabezpieczenie przed przepełnieniem pamięci (limit 16 KB na nagłówki HTTP).
-            if (raw.size() > 16384) {
-                throw std::runtime_error("Przekroczono maksymalny rozmiar nagłówków HTTP.");
-            }
-        }
+        const HeaderReadResult header_result =
+        read_response_head(session.transport, 16384);
 
-        const size_t header_end = raw.find("\r\n\r\n");
-        const std::string headers_only = raw.substr(0, header_end);
-        const std::string body_prefix = raw.substr(header_end + 4);
+        const std::string& headers_only = header_result.headers_only;
+        const std::string& body_prefix = header_result.body_prefix;
 
-        session.response = parse_response_headers(headers_only);
+        session.response = parse_response_headers_relaxed(headers_only);
 
         {
             std::string printable_headers = headers_only;
@@ -414,13 +550,24 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
             config::log_comm(printable_headers, cfg.verbosity);
         }
 
-        const std::string set_cookie = session.response.headers.get("set-cookie");
-        if (!set_cookie.empty()) {
-            cookie = parse_cookie(set_cookie, url);
-
-            if (cookie.has_value()) {
-                config::log_debug("stored cookie " + cookie->name +
-                                  " for domain " + cookie->domain, cfg.verbosity);
+        const auto set_cookies = session.response.headers.get_all("set-cookie");
+        for (const auto& sc : set_cookies) {
+            auto parsed = parse_cookie(sc, url);
+            if (parsed.has_value()) {
+                config::log_debug("stored cookie " + parsed->name +
+                                  " for domain " + parsed->domain, cfg.verbosity);
+                
+                bool found = false;
+                for (auto& existing : cookies) {
+                    if (existing.name == parsed->name && existing.domain == parsed->domain) {
+                        existing = *parsed;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    cookies.push_back(*parsed);
+                }
             } else {
                 config::log_noncritical("ignoring malformed Set-Cookie header", cfg.verbosity);
             }
@@ -462,92 +609,84 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
     throw std::runtime_error("Zbyt wiele przekierowań.");
 }
 
-void consume_available_data(StreamSession& session,
-                            const config::RadioClientConfig& cfg,
-                            bool& server_closed) {
-    server_closed = false;
-
-    if (session.input_buffer.empty()) {
-        char buf[4096];
+ConsumeResult consume_available_data(StreamSession& session,
+                                     const config::RadioClientConfig& cfg,
+                                     bool attempt_read) {
+    ConsumeResult res;
+    
+    // 1. Odczyt z gniazda tylko jeśli zostaliśmy o to poproszeni
+    if (attempt_read) {
+        char buf[16384]; // Zwiększamy bufor dla lepszej wydajności
         const ssize_t n = session.transport.read_some(buf, sizeof(buf));
+        
         if (n == 0) {
-            server_closed = true;
-            return;
+            res.server_closed = true;
+            return res;
         }
         if (n < 0) {
             throw std::runtime_error("Błąd odczytu danych z połączenia.");
         }
         session.input_buffer.insert(session.input_buffer.end(), buf, buf + n);
+        res.received_new_bytes = true;
     }
 
+    // 2. Jeśli nie ma multipleksowania, po prostu zrzucamy wszystko na STDOUT
     if (!cfg.multiplexing_enabled || !session.icy_metaint.has_value()) {
         if (!session.input_buffer.empty()) {
-            write_all_fd(STDOUT_FILENO,
-                         session.input_buffer.data(),
-                         session.input_buffer.size());
+            write_all_fd(STDOUT_FILENO, session.input_buffer.data(), session.input_buffer.size());
             session.input_buffer.clear();
         }
-        return;
+        return res;
     }
 
-    while (!session.input_buffer.empty()) {
+    // 3. Demultipleksowanie przy użyciu indeksu (zamiast powolnego erase)
+    size_t idx = 0;
+    while (idx < session.input_buffer.size()) {
+        
         if (session.metadata_bytes_remaining > 0) {
+            // Jesteśmy w trakcie czytania bloku metadanych
             const size_t chunk = std::min(session.metadata_bytes_remaining,
-                                          session.input_buffer.size());
+                                          session.input_buffer.size() - idx);
 
             session.metadata_buffer.insert(session.metadata_buffer.end(),
-                                           session.input_buffer.begin(),
-                                           session.input_buffer.begin() + static_cast<std::ptrdiff_t>(chunk));
+                                           session.input_buffer.begin() + idx,
+                                           session.input_buffer.begin() + idx + chunk);
 
-            session.input_buffer.erase(session.input_buffer.begin(),
-                                       session.input_buffer.begin() + static_cast<std::ptrdiff_t>(chunk));
-
+            idx += chunk;
             session.metadata_bytes_remaining -= chunk;
 
             if (session.metadata_bytes_remaining == 0) {
-                // Usuwamy padding \0 i dodajemy znak nowej linii. (forum)
-                while (!session.metadata_buffer.empty() &&
-                       session.metadata_buffer.back() == '\0') {
-                    session.metadata_buffer.pop_back();
-                }
-
-                if (!session.metadata_buffer.empty()) {
-                    write_all_fd(STDERR_FILENO,
-                                 session.metadata_buffer.data(),
-                                 session.metadata_buffer.size());
-                    write_all_fd(STDERR_FILENO, "\n", 1);
-                }
-
-                session.metadata_buffer.clear();
+                flush_remaining_metadata(session); // Usuwa zera i wysyła na STDERR
                 session.audio_bytes_until_metadata = *session.icy_metaint;
             }
-
-            continue;
-        }
-
-        if (session.audio_bytes_until_metadata == 0) {
-            const unsigned char len = static_cast<unsigned char>(session.input_buffer.front());
-            session.input_buffer.erase(session.input_buffer.begin());
+        } 
+        else if (session.audio_bytes_until_metadata == 0) {
+            // Czytamy bajt długości metadanych
+            const unsigned char len = static_cast<unsigned char>(session.input_buffer[idx]);
+            idx += 1; // przesuwamy indeks
             session.metadata_bytes_remaining = static_cast<size_t>(len) * 16;
 
             if (session.metadata_bytes_remaining == 0) {
+                // Pusty blok metadanych (częsta sytuacja)
                 session.audio_bytes_until_metadata = *session.icy_metaint;
             }
-            continue;
+        } 
+        else {
+            // Jesteśmy w trakcie czytania bloku audio
+            const size_t chunk = std::min(session.audio_bytes_until_metadata,
+                                          session.input_buffer.size() - idx);
+
+            write_all_fd(STDOUT_FILENO, session.input_buffer.data() + idx, chunk);
+
+            idx += chunk;
+            session.audio_bytes_until_metadata -= chunk;
         }
-
-        const size_t chunk = std::min(session.audio_bytes_until_metadata,
-                                      session.input_buffer.size());
-
-        write_all_fd(STDOUT_FILENO,
-                     session.input_buffer.data(),
-                     chunk);
-
-        session.input_buffer.erase(session.input_buffer.begin(),
-                                   session.input_buffer.begin() + static_cast<std::ptrdiff_t>(chunk));
-
-        session.audio_bytes_until_metadata -= chunk;
     }
+    
+    // Usuwamy przetworzone dane z bufora tylko raz na koniec
+    session.input_buffer.erase(session.input_buffer.begin(), session.input_buffer.begin() + idx);
+    
+    return res;
 }
 
 void flush_remaining_metadata(StreamSession& session) {

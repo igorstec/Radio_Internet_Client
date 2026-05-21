@@ -37,7 +37,6 @@ namespace config {
         int protocol = 0;
     };
 
-
     [[nodiscard]] RadioUrlParts parse_url(std::string_view url);
     [[nodiscard]] int validate_config(const RadioClientConfig& config);
     [[nodiscard]] RadioClientConfig parse_arguments(int argc, char* argv[]);

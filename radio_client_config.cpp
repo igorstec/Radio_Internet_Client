@@ -57,18 +57,33 @@ namespace config
             result.path = "/";
         }
 
-        auto port_pos = url.rfind(':');
-        if (port_pos != std::string_view::npos) {
-            result.host = std::string(url.substr(0, port_pos));
-            result.port = std::string(url.substr(port_pos + 1));
+        if (url.starts_with('[')) {
+            // Mamy do czynienia z adresem IPv6 w nawiasach
+            auto bracket_end = url.find(']');
+            if (bracket_end != std::string_view::npos) {
+                result.host = std::string(url.substr(0, bracket_end + 1)); // np. "[::1]"
+                
+                // Sprawdzamy czy za nawiasem jest dwukropek oznaczający port
+                if (bracket_end + 1 < url.size() && url[bracket_end + 1] == ':') {
+                    result.port = std::string(url.substr(bracket_end + 2));
+                }
+            } else {
+                result.host = std::string(url); // Błędny format, ale niech leci dalej
+            }
         } else {
-            result.host = std::string(url);
+            // Standardowy przypadek (IPv4 lub domena)
+            auto port_pos = url.rfind(':');
+            if (port_pos != std::string_view::npos) {
+                result.host = std::string(url.substr(0, port_pos));
+                result.port = std::string(url.substr(port_pos + 1));
+            } else {
+                result.host = std::string(url);
+            }
         }
 
         if (result.host.empty()) {
             throw std::invalid_argument("Błąd: Host w URL nie może być pusty.\n");
         }
-
 
         return result;
     }
