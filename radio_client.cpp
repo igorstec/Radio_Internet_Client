@@ -11,7 +11,6 @@
 #include <unistd.h>
 #include <string_view>
 
-
 namespace {
     const size_t CONNECTIONS = 2;
     const char quit_string[] = "quit\n";
@@ -43,7 +42,7 @@ int main(int argc, char* argv[]) {
         while (reconnect_needed && !finish) {
             reconnect_needed = false;
 
-            config::log_comm("opening streaming session", cfg.verbosity);
+            config::log_debug("opening streaming session", cfg.verbosity);
 
             // Otwórz sesję strumieniową (łączy się z serwerem, wysyła żądanie i odbiera nagłówki)
             radio_http::StreamSession session = radio_http::open_stream_session(cfg, url);
@@ -57,6 +56,8 @@ int main(int argc, char* argv[]) {
             poll_descriptors[CLIENT_SOCKET_IDX].events = POLLIN | POLLERR | POLLHUP;
             poll_descriptors[CLIENT_SOCKET_IDX].revents = 0;
 
+            std::string stdin_buffer;
+            
             while (!finish) {
                 poll_descriptors[CLIENT_STDIN_IDX].revents = 0;
                 poll_descriptors[CLIENT_SOCKET_IDX].revents = 0;
@@ -83,21 +84,41 @@ int main(int argc, char* argv[]) {
 
                 if (poll_descriptors[CLIENT_STDIN_IDX].revents & POLLIN) {
                     char input[256];
-                    ssize_t n = read(STDIN_FILENO, input, sizeof(input) - 1);
+                    ssize_t n = read(STDIN_FILENO, input, sizeof(input));
                     if (n < 0) {
                         if (errno == EINTR) {
                             config::log_debug("stdin read interrupted by signal", cfg.verbosity);
                         } else {
-                            throw std::runtime_error("Błąd podczas odczytu ze standardowego wejścia: " +
-                                                     std::string(std::strerror(errno)));
+                            throw std::runtime_error("Błąd odczytu z STDIN: " + std::string(std::strerror(errno)));
                         }
                     } else if (n > 0) {
-                        input[n] = '\0';
+                        // Doklejamy przeczytane bajty do bufora
+                        stdin_buffer.append(input, static_cast<size_t>(n));
 
-                        if (std::strncmp(input, quit_string, 5) == 0) {
-                            config::log_debug("received quit command", cfg.verbosity);
-                            finish = 1;
-                            break;
+                        // Przetwarzamy bufor linijka po linijce
+                        size_t pos;
+                        while ((pos = stdin_buffer.find('\n')) != std::string::npos) {
+                            // Wyciągamy jedną pełną linię (bez znaku nowej linii)
+                            std::string line = stdin_buffer.substr(0, pos);
+                            
+                            // Usuwamy tę linię z bufora (wraz ze znakiem nowej linii)
+                            stdin_buffer.erase(0, pos + 1);
+
+                            // Sprawdzamy, czy linia to dokładnie słowo "quit"
+                            if (line == "quit") {
+                                config::log_debug("received quit command", cfg.verbosity);
+                                finish = 1;
+                                break;
+                            }
+                        }
+
+                        if (finish) {
+                            break; // Przerywa zewnętrzną pętlę poll, jeśli znaleziono quit
+                        }
+
+                        // Zabezpieczenie przed przepełnieniem RAM w przypadku złośliwego spamu bez znaków nowej linii
+                        if (stdin_buffer.size() > 4096) {
+                            stdin_buffer.clear();
                         }
                     }
                 }
@@ -111,7 +132,7 @@ int main(int argc, char* argv[]) {
                     radio_http::consume_available_data(session, cfg, current_server_closed);
 
                     if (current_server_closed) {
-                        config::log_comm("server closed connection", cfg.verbosity);
+                        config::log_debug("server closed connection", cfg.verbosity);
                         finish = 1;
                         break;
                     }
@@ -124,6 +145,17 @@ int main(int argc, char* argv[]) {
 
             config::log_debug("closing current session", cfg.verbosity);
             
+            // 1. Zabezpieczenie przed ucięciem body_prefix (audio/metadane pobrane przy nagłówkach)
+            if (!session.input_buffer.empty()) {
+                bool dummy_closed = false;
+                // Wywołanie consume_available_data gdy input_buffer nie jest pusty, 
+                // gwarantuje zdemultipleksowanie i wypisanie resztek na STDOUT bez czytania z gniazda.
+                radio_http::consume_available_data(session, cfg, dummy_closed);
+            }
+
+            // 2. Wypisanie "dotychczas odebranych" resztek metadanych przed zamknięciem strumienia
+            radio_http::flush_remaining_metadata(session);
+
             session.transport.close();
         }
 

@@ -1,5 +1,8 @@
 #include "radio_http.h"
 
+#include <iomanip>
+#include <sstream>
+#include <chrono>
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
@@ -236,6 +239,16 @@ void Transport::connect_to(const config::RadioUrlParts& url,
 
     const auto endpoint = config::get_server_endpoint(url.host.c_str(), url.port.c_str(), client_cfg);
 
+    if (client_cfg.verbosity >= config::VERBOSITY_COMMUNICATION) {
+        auto now = std::chrono::system_clock::now();
+        auto time_t_now = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_now{};
+        localtime_r(&time_t_now, &tm_now);
+        char time_buf[64];
+        std::strftime(time_buf, sizeof(time_buf), "%Y.%m.%d %H.%M.%S", &tm_now);
+        config::log_comm(time_buf, client_cfg.verbosity);
+    }
+    
     config::log_comm("resolving name " + url.host, client_cfg.verbosity);
     config::log_comm("connecting to server " + endpoint_to_string(endpoint) + ":" + url.port, client_cfg.verbosity);
 
@@ -362,11 +375,13 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
 
         {
             std::string printable = request;
+            // Usuwamy \r. Zostawiamy jeden końcowy \n, żeby razem z nową linią
+            // od log_comm dało nam to dwie puste linie (zgodnie z przykładami).
             printable.erase(std::remove(printable.begin(), printable.end(), '\r'), printable.end());
             if (!printable.empty() && printable.back() == '\n') {
                 printable.pop_back();
             }
-            config::log_debug(printable, cfg.verbosity);
+            config::log_comm(printable, cfg.verbosity);
         }
 
         session.transport.write_all(request.data(), request.size());
@@ -380,6 +395,11 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
                 throw std::runtime_error("Serwer zamknął połączenie przed końcem nagłówków.");
             }
             raw.append(buf, static_cast<size_t>(n));
+            
+            // Zabezpieczenie przed przepełnieniem pamięci (limit 16 KB na nagłówki HTTP).
+            if (raw.size() > 16384) {
+                throw std::runtime_error("Przekroczono maksymalny rozmiar nagłówków HTTP.");
+            }
         }
 
         const size_t header_end = raw.find("\r\n\r\n");
@@ -388,9 +408,10 @@ StreamSession open_stream_session(const config::RadioClientConfig& cfg,
 
         session.response = parse_response_headers(headers_only);
 
-        config::log_debug(session.response.raw_status_line, cfg.verbosity);
-        for (const auto& [k, v] : session.response.headers.values) {
-            config::log_debug(k + ": " + v, cfg.verbosity);
+        {
+            std::string printable_headers = headers_only;
+            printable_headers.erase(std::remove(printable_headers.begin(), printable_headers.end(), '\r'), printable_headers.end());
+            config::log_comm(printable_headers, cfg.verbosity);
         }
 
         const std::string set_cookie = session.response.headers.get("set-cookie");
@@ -484,16 +505,11 @@ void consume_available_data(StreamSession& session,
             session.metadata_bytes_remaining -= chunk;
 
             if (session.metadata_bytes_remaining == 0) {
-                while (!session.metadata_buffer.empty() &&
-                       session.metadata_buffer.back() == '\0') {
-                    session.metadata_buffer.pop_back();
-                }
-
+                // Wypisujemy dokłądnie to, co otrzymaliśmy (z paddingiem \0), bez dodawania \n.
                 if (!session.metadata_buffer.empty()) {
                     write_all_fd(STDERR_FILENO,
                                  session.metadata_buffer.data(),
                                  session.metadata_buffer.size());
-                    write_all_fd(STDERR_FILENO, "\n", 1);
                 }
 
                 session.metadata_buffer.clear();
@@ -525,6 +541,15 @@ void consume_available_data(StreamSession& session,
                                    session.input_buffer.begin() + static_cast<std::ptrdiff_t>(chunk));
 
         session.audio_bytes_until_metadata -= chunk;
+    }
+}
+
+void flush_remaining_metadata(StreamSession& session) {
+    if (!session.metadata_buffer.empty()) {
+        write_all_fd(STDERR_FILENO, 
+                     session.metadata_buffer.data(), 
+                     session.metadata_buffer.size());
+        session.metadata_buffer.clear();
     }
 }
 

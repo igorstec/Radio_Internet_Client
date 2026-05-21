@@ -76,4 +76,6 @@ void consume_available_data(StreamSession& session,
                             const config::RadioClientConfig& cfg,
                             bool& server_closed);
 
+void flush_remaining_metadata(StreamSession& session);
+
 } // namespace radio_http
