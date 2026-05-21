@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <signal.h>
 #include <string_view>
+#include <cstdint>
 
 namespace {
 
@@ -72,25 +73,19 @@ namespace config
         return result;
     }
 
-    [[nodiscard]] int validate_config(const config::RadioClientConfig &config) noexcept
+    [[nodiscard]] int validate_config(const config::RadioClientConfig &config)
     {
         if (config.url.empty())
         {
-            // Niezalenie do verbosity bo informacje o błędnym wywołaniu (błędnych parametrach) powinny być zawsze wyświetlane
             throw std::invalid_argument("Błąd: Parametr obowiązkowy -u (url) nie został podany.\n");
-            return 1;
         }
         if (config.client_timeout_ms < 100 || config.client_timeout_ms > 100000)
         {
-            // Niezalenie do verbosity bo informacje o błędnym wywołaniu (błędnych parametrach) powinny być zawsze wyświetlane
             throw std::invalid_argument("Błąd: Timeout musi być w przedziale [100, 100000].\n");
-            return 1;
         }
         if (config.verbosity > 4)
         {
-            // Niezalenie do verbosity bo informacje o błędnym wywołaniu (błędnych parametrach) powinny być zawsze wyświetlane
             throw std::invalid_argument("Błąd: Verbosity musi być w przedziale [0, 4].\n");
-            return 1;
         }
         return 0; // Wszystko OK
     }

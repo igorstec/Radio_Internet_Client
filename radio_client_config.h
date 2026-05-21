@@ -39,7 +39,7 @@ namespace config {
 
 
     [[nodiscard]] RadioUrlParts parse_url(std::string_view url);
-    [[nodiscard]] int validate_config(const RadioClientConfig& config) noexcept;
+    [[nodiscard]] int validate_config(const RadioClientConfig& config);
     [[nodiscard]] RadioClientConfig parse_arguments(int argc, char* argv[]);
 
     uint16_t read_port(char const *string);
